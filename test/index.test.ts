@@ -434,6 +434,48 @@ describe("collectSliceState", () => {
     expect(state.lastAssistantMessage).not.toContain("secret reasoning");
   });
 
+  // At before_agent_start the incoming request is not in the session yet, so the session
+  // lookup returns the PREVIOUS request. Observed live: skill-recall, whose whole job is
+  // suggesting a skill for the request about to run, was rendered
+  // `status=unavailable` and asked to choose with no request in hand.
+  it("prefers the pending request over the session's last user message", () => {
+    const state = collectSliceState({
+      sees: ["last_user_message"],
+      ctx,
+      turnToolCalls: [],
+      commands: [],
+      pendingUserMessage: "the request about to run",
+    });
+    expect(state.lastUserMessage).toBe("the request about to run");
+    // The stale one must not win: "hello there" is what the session holds.
+    expect(state.lastUserMessage).not.toBe("hello there");
+  });
+
+  it("falls back to the session when no pending request is supplied", () => {
+    for (const pending of [undefined, ""]) {
+      const state = collectSliceState({
+        sees: ["last_user_message"],
+        ctx,
+        turnToolCalls: [],
+        commands: [],
+        pendingUserMessage: pending,
+      });
+      expect(state.lastUserMessage).toBe("hello there");
+    }
+  });
+
+  // A pending request must not leak into slices that describe the session's own history.
+  it("does not let the pending request stand in for the last assistant message", () => {
+    const state = collectSliceState({
+      sees: ["last_assistant_message"],
+      ctx,
+      turnToolCalls: [],
+      commands: [],
+      pendingUserMessage: "the request about to run",
+    });
+    expect(state.lastAssistantMessage).toBe("visible answer");
+  });
+
   it("takes only skill-sourced commands as skills", () => {
     const state = collectSliceState({
       sees: ["skills"],
@@ -615,6 +657,30 @@ describe("delivery", () => {
     await fire(h, "session_start", {}, ctx);
     return { ctx, notices };
   }
+
+  // The WIRING, pinned separately from collectSliceState's own behaviour. Those unit
+  // tests pass an argument directly; nothing there proves the handler supplies it. A
+  // mutant dropping `event.prompt` at the call site would otherwise survive the suite --
+  // the same hole a trust-gate mutant found earlier on this branch.
+  it("hands a before_agent_start observer the request that is about to run", async () => {
+    const h = harness();
+    const d = def({ name: "obs", on: "before_agent_start", sees: ["last_user_message"] });
+    const seen: Array<string | undefined> = [];
+    const capturing = {
+      name: "obs",
+      async run(state: { lastUserMessage?: string }) {
+        seen.push(state.lastUserMessage);
+        return null;
+      },
+      dispose() {},
+    };
+    const { ctx } = await bootWith(h, [d], { obs: capturing });
+
+    await fire(h, "before_agent_start", { prompt: "summarise the release notes" }, ctx);
+    await tick();
+
+    expect(seen).toEqual(["summarise the release notes"]);
+  });
 
   it("delivers a next_prompt advisory as a before_agent_start message", async () => {
     const h = harness();

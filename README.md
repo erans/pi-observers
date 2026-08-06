@@ -26,9 +26,27 @@ Or load directly for development:
 
 ## Writing an observer
 
-Drop a markdown file in `.pi/observers/` (project) or `~/.pi/agent/observers/`
-(global). Same-named files override the bundled ones; project beats global beats
-bundled.
+Drop a markdown file in `.pi/observers/`. Definitions are read from three directories,
+lowest precedence first:
+
+| Layer | Directory | Loaded |
+|---|---|---|
+| bundled | this package's `observers/` | always |
+| user | `<agent dir>/observers/` -- `~/.pi/agent/observers/` unless you moved it | always |
+| project | `.pi/observers/` in the working directory | **only when the project is trusted** |
+
+A later layer beats an earlier one, so a project definition wins over a user one, which
+wins over a bundled one. **Precedence keys on the `name:` field, not the filename** --
+to replace the shipped `goal-tracker`, give any file you like `name: goal-tracker` and
+yours is used in its place, entirely: prompt, trigger, model, permissions. Overriding
+one observer never disturbs the others.
+
+Layers are additive, not exclusive. A bundled observer you have not overridden still
+loads -- there is no "use only mine" switch. To run only your own, name the ones you do
+not want in `disable` (see Settings).
+
+See [Trust](#trust) for why the project layer is gated and what you see when it is
+skipped.
 
     ---
     name: my-observer
@@ -38,8 +56,8 @@ bundled.
     tools: [read, grep]             # read-only only: read, grep, find, ls
     can: [advise]                   # advise, veto
     deliver: next_prompt            # next_prompt | next_turn | settle
-    model: lunaroute/deepseek-v4-flash
-    fallback: [anthropic/claude-haiku-4-5]
+    model: anthropic/claude-haiku-4-5
+    fallback: [openai-codex/gpt-5.5]
     priority: 50
     ---
     Your system prompt. Call `propose` once, or nothing at all.
@@ -108,6 +126,12 @@ is the only trigger that sees the right request -- and that handler is also wher
 `next_prompt` is drained. Its suggestion therefore lands on your **next** request
 rather than the current one.
 
+At that trigger the request has not been recorded in the session yet, so
+`last_user_message` is taken from the event rather than looked up. Reading the session
+there returns the *previous* request, or nothing at all on the first request of a
+session -- which is what `skill-recall` was actually being handed until this was fixed:
+an empty slice, and a prompt asking it to choose a skill with no request in hand.
+
 This is a consequence of the non-blocking design, not an oversight. Serving the current
 request would mean holding it open while a second model call finished, which is latency
 on every request to catch the minority that need a skill. If you want that trade, the
@@ -149,12 +173,40 @@ same point again -- it is not silently recorded as delivered.
         "enabled": true,
         "maxAdvisoriesPerTurn": 2,
         "vetoBudget": 3,
-        "defaultModel": "lunaroute/deepseek-v4-flash",
+        "defaultModel": "anthropic/claude-haiku-4-5",
         "disable": ["verification"]
       }
     }
 
 `maxAdvisoriesPerTurn` and `vetoBudget` are both capped at 10 however high you set them.
+
+### Which model an observer runs on
+
+Every observer is resolved through the same chain, in order, stopping at the first hit:
+
+1. its own `model:`, or `defaultModel` if it declares none
+2. each entry in its `fallback:`, in order
+3. **the session's own model** -- whatever you are running pi with
+4. otherwise the observer is disabled, with the reason shown in `/observers`
+
+Steps 1 and 2 each try an exact match, then a fuzzy one, then the same id under any
+provider. So **you do not have to set `defaultModel` at all**: leave it out and every
+observer runs on your session model. Setting it is worth doing anyway -- observers are
+small, frequent, throwaway calls, and pointing them at something cheap and fast keeps
+them off your main model's bill.
+
+A model is only considered for steps 1 and 2 if its provider has configured auth.
+That is what makes the chain useful: naming a model you have no credentials for falls
+through to your fallbacks and then to the session model, rather than resolving to
+something that cannot run.
+
+The gap worth knowing: auth is not the same as *working*. A model that is in pi's
+catalog, with auth configured, but which the provider refuses at call time -- a
+retired id, a model your account is not entitled to -- resolves successfully. The
+observer is then reported active on that model, every run fails, and it is disabled
+after three consecutive failures with the provider's error in `/observers`. Nothing
+can predict that without making the call; the three-strike disable is the backstop,
+and it is why `/observers` reports the last error rather than only a count.
 
 `vetoBudget` is per observer **per fingerprint** -- the string the observer uses to
 identify the thing it is objecting to. It is not a bound on its own, because the
