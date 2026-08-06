@@ -19,21 +19,37 @@ export function createOutputTools(def: ObserverDefinition) {
   let proposal: Proposal | null = null;
   const warnings: string[] = [];
 
+  /**
+   * Validate and trim a string field, rejecting empty or whitespace-only values.
+   * Mirrors the convention from src/definitions.ts requireString().
+   */
+  const requireNonEmpty = (value: unknown, fieldName: string): string => {
+    if (typeof value !== "string" || value.trim() === "") {
+      throw new Error(`${fieldName} must be a non-empty string.`);
+    }
+    return value.trim();
+  };
+
   const record = (kind: Proposal["kind"], text: string, fingerprint: string) => {
+    // Validate inputs BEFORE checking for existing proposal or length.
+    // This ensures rejected calls don't consume the observer's one emission.
+    const trimmedText = requireNonEmpty(text, kind === "advisory" ? "Advisory" : "Reason");
+    const trimmedFingerprint = requireNonEmpty(fingerprint, "Fingerprint");
+
     if (proposal) {
       warnings.push(`${def.name} already proposed this run; ignoring the extra ${kind}.`);
       return `Ignored: ${def.name} has already emitted once this run.`;
     }
-    if (text.length > def.maxAdvisoryChars) {
+    if (trimmedText.length > def.maxAdvisoryChars) {
       throw new Error(
-        `Text is ${text.length} chars, which exceeds max_advisory_chars (${def.maxAdvisoryChars}). Be brief.`,
+        `Text is ${trimmedText.length} chars, which exceeds max_advisory_chars (${def.maxAdvisoryChars}). Be brief.`,
       );
     }
     proposal = {
       observer: def.name,
       kind,
-      text,
-      fingerprint,
+      text: trimmedText,
+      fingerprint: trimmedFingerprint,
       priority: def.priority,
       deliver: def.deliver,
     };

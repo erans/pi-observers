@@ -106,5 +106,107 @@ describe("createOutputTools", () => {
         call(vetoTool, { reason: "toolong", fingerprint: "v1" })
       ).rejects.toThrow(/exceeds max_advisory_chars/);
     });
+
+    // Input validation tests
+    describe("input validation", () => {
+      it("throws when advisory is empty string", async () => {
+        const { tools } = createOutputTools(defOf());
+        await expect(call(tools[0], { advisory: "", fingerprint: "fp" })).rejects.toThrow(
+          /Advisory must be a non-empty string/,
+        );
+      });
+
+      it("throws when advisory is whitespace-only", async () => {
+        const { tools } = createOutputTools(defOf());
+        await expect(call(tools[0], { advisory: "   \t\n  ", fingerprint: "fp" })).rejects.toThrow(
+          /Advisory must be a non-empty string/,
+        );
+      });
+
+      it("throws when veto reason is empty string", async () => {
+        const { tools } = createOutputTools(defOf({ can: ["veto"] }));
+        const vetoTool = tools.find((t) => t.name === "veto")!;
+        await expect(call(vetoTool, { reason: "", fingerprint: "fp" })).rejects.toThrow(
+          /Reason must be a non-empty string/,
+        );
+      });
+
+      it("throws when veto reason is whitespace-only", async () => {
+        const { tools } = createOutputTools(defOf({ can: ["veto"] }));
+        const vetoTool = tools.find((t) => t.name === "veto")!;
+        await expect(call(vetoTool, { reason: "  \n  ", fingerprint: "fp" })).rejects.toThrow(
+          /Reason must be a non-empty string/,
+        );
+      });
+
+      it("throws when fingerprint is empty string", async () => {
+        const { tools } = createOutputTools(defOf());
+        await expect(call(tools[0], { advisory: "text", fingerprint: "" })).rejects.toThrow(
+          /Fingerprint must be a non-empty string/,
+        );
+      });
+
+      it("throws when fingerprint is whitespace-only", async () => {
+        const { tools } = createOutputTools(defOf());
+        await expect(call(tools[0], { advisory: "text", fingerprint: "   \t  " })).rejects.toThrow(
+          /Fingerprint must be a non-empty string/,
+        );
+      });
+
+      it("leaves collector empty after a rejected call (advisory)", async () => {
+        const { tools, collector } = createOutputTools(defOf());
+        await expect(call(tools[0], { advisory: "", fingerprint: "fp" })).rejects.toThrow();
+        expect(collector.take()).toBeNull();
+        expect(collector.warnings).toHaveLength(0);
+      });
+
+      it("leaves collector empty after a rejected call (fingerprint)", async () => {
+        const { tools, collector } = createOutputTools(defOf());
+        await expect(call(tools[0], { advisory: "valid text", fingerprint: "" })).rejects.toThrow();
+        expect(collector.take()).toBeNull();
+        expect(collector.warnings).toHaveLength(0);
+      });
+
+      it("observer cannot spoof priority in propose call", async () => {
+        const { tools, collector } = createOutputTools(defOf({ priority: 50 }));
+        // Try to pass a spoofed priority field (and other fields)
+        await call(tools[0], {
+          advisory: "text",
+          fingerprint: "fp",
+          priority: 999,
+          deliver: "settle",
+          observer: "malicious",
+          kind: "veto",
+        } as any);
+        const proposal = collector.take();
+        expect(proposal).toMatchObject({
+          observer: "o", // From def, not spoofed
+          kind: "advisory", // From record() kind, not spoofed
+          priority: 50, // From def, not spoofed
+          deliver: "next_prompt", // From def, not spoofed
+        });
+      });
+
+      it("observer cannot spoof priority in veto call", async () => {
+        const { tools, collector } = createOutputTools(defOf({ can: ["veto"], priority: 75 }));
+        const vetoTool = tools.find((t) => t.name === "veto")!;
+        // Try to pass a spoofed priority field (and other fields)
+        await call(vetoTool, {
+          reason: "incomplete",
+          fingerprint: "fp",
+          priority: 999,
+          deliver: "settle",
+          observer: "malicious",
+          kind: "advisory",
+        } as any);
+        const proposal = collector.take();
+        expect(proposal).toMatchObject({
+          observer: "o", // From def, not spoofed
+          kind: "veto", // From record() kind, not spoofed
+          priority: 75, // From def, not spoofed
+          deliver: "next_prompt", // From def, not spoofed
+        });
+      });
+    });
   });
 });
