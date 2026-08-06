@@ -70,7 +70,7 @@ Tests live in `test/<name>.test.ts` mirroring `src/`.
   "license": "MIT",
   "keywords": ["pi-package", "pi", "pi-extension", "observer", "agent"],
   "dependencies": {
-    "typebox": "^0.34.0"
+    "typebox": "^1.3.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.83.0",
@@ -1711,6 +1711,32 @@ describe("ProposalBus", () => {
     expect(bus.status("o").failures).toBe(1);
   });
 
+  it("times out a run that ignores its abort signal", async () => {
+    const bus = new ProposalBus();
+    // Deliberately uncooperative: never settles, never listens for abort.
+    bus.kick("o", 10, () => new Promise<Proposal | null>(() => {}));
+    await bus.settle();
+    expect(bus.status("o").failures).toBe(1);
+    expect(bus.status("o").lastError).toContain("timed out");
+    // The slot must be released, or the observer is silently wedged forever.
+    const run = vi.fn(async () => proposal("a"));
+    bus.kick("o", 1000, run);
+    await bus.settle();
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a late proposal from a run abandoned at timeout", async () => {
+    const bus = new ProposalBus();
+    bus.kick("o", 10, async () => {
+      await new Promise((r) => setTimeout(r, 60));
+      return proposal("late");
+    });
+    await bus.settle();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(bus.drain()).toEqual([]);
+    expect(bus.status("o").failures).toBe(1);
+  });
+
   it("disables an observer after three consecutive failures", async () => {
     const bus = new ProposalBus();
     for (let i = 0; i < 3; i++) {
@@ -1806,10 +1832,28 @@ export class ProposalBus {
     if (entry.inflight) return; // one run per observer at a time; a re-kick is dropped, not queued
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error("observer run timed out")), timeoutMs);
     entry.controller = controller;
 
-    entry.inflight = run(controller.signal)
+    // The timeout must settle the bus's OWN bookkeeping, not merely signal the run.
+    // A run that ignores its AbortSignal (or awaits something that never rejects on
+    // abort) would otherwise leave entry.inflight pending forever: the observer is
+    // then permanently silent, because every later kick hits the in-flight guard —
+    // yet status() reports runs: 0, failures: 0, disabled: false. Racing guarantees
+    // the failure is counted and the slot is released no matter how the run behaves.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort(new Error("observer run timed out"));
+        reject(new Error("observer run timed out"));
+      }, timeoutMs);
+    });
+
+    const runPromise = run(controller.signal);
+    // An abandoned run that rejects AFTER the race was already decided must not
+    // surface as an unhandled rejection.
+    runPromise.catch(() => {});
+
+    entry.inflight = Promise.race([runPromise, timeout])
       .then((proposal) => {
         entry.runs += 1;
         entry.consecutiveFailures = 0;
@@ -1917,6 +1961,32 @@ describe("parseSettings", () => {
   it("ignores a non-object", () => {
     expect(parseSettings("nope").enabled).toBe(true);
   });
+
+  it('honors enabled: "false" instead of coercing it to true', () => {
+    // Boolean("false") is true. Coercion here would silently invert the user's intent,
+    // which is the same defect definitions.ts already had to fix.
+    expect(parseSettings({ enabled: "false" }).enabled).toBe(false);
+    expect(parseSettings({ enabled: "true" }).enabled).toBe(true);
+  });
+
+  it("falls back rather than coercing a nonsense enabled value", () => {
+    expect(parseSettings({ enabled: "yes" }).enabled).toBe(true);
+    expect(parseSettings({ enabled: 0 }).enabled).toBe(true);
+  });
+
+  it("rejects a boolean where a count is expected", () => {
+    // Number(true) === 1, which would silently read as "one advisory per turn".
+    expect(parseSettings({ maxAdvisoriesPerTurn: true }).maxAdvisoriesPerTurn).toBe(2);
+  });
+
+  it("clamps counts to the safety ceiling", () => {
+    expect(parseSettings({ maxAdvisoriesPerTurn: 999999 }).maxAdvisoriesPerTurn).toBe(10);
+    expect(parseSettings({ vetoBudget: 999999 }).vetoBudget).toBe(10);
+  });
+
+  it("drops non-string and blank entries from disable", () => {
+    expect(parseSettings({ disable: ["a", "", "  ", null, 7, {}, " b "] }).disable).toEqual(["a", "b"]);
+  });
 });
 
 describe("isObserverEnabled", () => {
@@ -1960,12 +2030,38 @@ export interface ObserverSettings {
   disable: string[];
 }
 
-function positiveIntOr(value: unknown, fallback: number): number {
+/** Safety ceilings on user-supplied values. Not preferences — these bound how much an
+ *  observer can inject into the main agent even if a settings file asks for more. */
+const MAX_ADVISORIES_LIMIT = 10;
+const MAX_VETO_BUDGET_LIMIT = 10;
+
+function positiveIntOr(value: unknown, fallback: number, max: number): number {
+  // Reject booleans explicitly: Number(true) === 1, which would silently accept
+  // `maxAdvisoriesPerTurn: true` as the number 1.
+  if (typeof value !== "number" && typeof value !== "string") return fallback;
   const num = Number(value);
-  return Number.isInteger(num) && num > 0 ? num : fallback;
+  if (!Number.isInteger(num) || num <= 0) return fallback;
+  // Upper bound is a safety limit, not a preference. The reconciler's per-turn cap and
+  // the veto budget are the only things bounding how much an observer can inject into
+  // the main agent; an unbounded value from a hand-edited settings file (a typo adding
+  // a digit) would re-enable exactly the runaway loop the budget exists to prevent.
+  return Math.min(num, max);
 }
 
-/** Tolerant by design: bad settings degrade to defaults rather than blocking startup. */
+/** Accepts a real boolean or the strings "true"/"false", matching the observer-file
+ *  convention in definitions.ts. Anything else falls back rather than coercing:
+ *  Boolean("false") is true, which would invert the user's stated intent. */
+function booleanOr(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return fallback;
+}
+
+/** Tolerant by design: bad settings degrade to defaults rather than blocking startup.
+ *  This is the deliberate difference from definitions.ts, which errors on bad input —
+ *  a broken observer file names one broken observer, a broken settings file would
+ *  otherwise take down every observer at once. */
 export function parseSettings(raw: unknown): ObserverSettings {
   const obj = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
   const defaultModel = typeof obj.defaultModel === "string" && obj.defaultModel.trim() !== ""
@@ -1973,11 +2069,13 @@ export function parseSettings(raw: unknown): ObserverSettings {
     : undefined;
 
   return {
-    enabled: obj.enabled === undefined ? true : Boolean(obj.enabled),
-    maxAdvisoriesPerTurn: positiveIntOr(obj.maxAdvisoriesPerTurn, DEFAULTS.maxAdvisoriesPerTurn),
-    vetoBudget: positiveIntOr(obj.vetoBudget, DEFAULTS.vetoBudget),
+    enabled: booleanOr(obj.enabled, true),
+    maxAdvisoriesPerTurn: positiveIntOr(obj.maxAdvisoriesPerTurn, DEFAULTS.maxAdvisoriesPerTurn, MAX_ADVISORIES_LIMIT),
+    vetoBudget: positiveIntOr(obj.vetoBudget, DEFAULTS.vetoBudget, MAX_VETO_BUDGET_LIMIT),
     defaultModel,
-    disable: Array.isArray(obj.disable) ? obj.disable.map(String) : [],
+    disable: Array.isArray(obj.disable)
+      ? obj.disable.filter((n): n is string => typeof n === "string" && n.trim() !== "").map((n) => n.trim())
+      : [],
   };
 }
 
@@ -2029,6 +2127,7 @@ import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
+import { parse } from "yaml";
 import { deriveDescription, deriveSlug, writeMemoryNote } from "../src/memory.ts";
 
 let cwd: string;
@@ -2094,6 +2193,43 @@ describe("writeMemoryNote", () => {
   it("rejects empty text", () => {
     expect(() => writeMemoryNote({ cwd, text: "   " })).toThrow(/empty/i);
   });
+
+  it("writes frontmatter that actually parses when the text contains YAML syntax", () => {
+    // Unquoted, each of these breaks the note: a colon fails to parse, a leading "-"
+    // becomes a sequence, and a leading "#" parses as null, silently losing the text.
+    for (const text of ["Use Vite: not Webpack", "#1 rule: no bash", "- prefer tabs"]) {
+      const { path } = writeMemoryNote({ cwd, text });
+      const raw = readFileSync(path, "utf8");
+      const fm = parse(raw.split("---")[1] as string);
+      expect(typeof fm.description).toBe("string");
+      expect(fm.description.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("falls back to project for an unrecognised type", () => {
+    const { path } = writeMemoryNote({ cwd, text: "some note here", type: "bogus\ninjected: yes" });
+    const fm = parse(readFileSync(path, "utf8").split("---")[1] as string);
+    expect(fm.type).toBe("project");
+    expect(fm.injected).toBeUndefined();
+  });
+});
+
+describe("deriveSlug — non-Latin", () => {
+  it("keeps non-Latin words instead of collapsing to the fallback", () => {
+    // An [a-z0-9] class would reduce every one of these to "note", so a user writing
+    // in Hebrew or Chinese would get note, note-2, note-3 with no descriptive filename.
+    expect(deriveSlug("הערה בעברית")).not.toBe("note");
+    expect(deriveSlug("中文笔记")).not.toBe("note");
+    expect(deriveSlug("café déjà vu")).toBe("café-déjà-vu");
+  });
+});
+
+describe("deriveDescription — truncation safety", () => {
+  it("does not split a surrogate pair at the cap", () => {
+    const d = deriveDescription("x".repeat(98) + "\u{1F600}" + "y".repeat(50));
+    expect(d).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(d).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
 });
 ```
 
@@ -2112,11 +2248,21 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 const MAX_DESCRIPTION = 100;
 const SLUG_WORDS = 6;
 
-/** Deterministic, no model call: first six words, kebab-cased. */
+/** The note `type` vocabulary from the design doc. An unrecognised value falls back
+ *  rather than being written through: `type` reaches here from a `--type` flag, and an
+ *  arbitrary string would both break the frontmatter and defeat any later filtering. */
+const NOTE_TYPES = ["project", "feedback", "reference", "user"] as const;
+const DEFAULT_NOTE_TYPE = "project";
+
+/** Deterministic, no model call: first six words, kebab-cased.
+ *  Unicode-aware on purpose. An [a-z0-9] class silently reduces any non-Latin note to
+ *  the fallback slug, so every Hebrew or Chinese note would land as note, note-2,
+ *  note-3 — losing the descriptive filename that is the whole point of the slug. It
+ *  also mangles accented Latin ("café déjà vu" -> "caf-d-j-vu"). */
 export function deriveSlug(text: string): string {
   const slug = text
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/g, "")
     .split("-")
     .filter(Boolean)
@@ -2130,9 +2276,11 @@ export function deriveDescription(text: string): string {
   const trimmed = text.trim().replace(/\s+/g, " ");
   const match = trimmed.match(/^.*?[.!?](\s|$)/);
   const sentence = (match ? match[0] : trimmed).trim();
-  return sentence.length > MAX_DESCRIPTION
-    ? `${sentence.slice(0, MAX_DESCRIPTION - 1).trimEnd()}…`
-    : sentence;
+  if (sentence.length <= MAX_DESCRIPTION) return sentence;
+  // Truncate by code point: slice() on UTF-16 units can cut a surrogate pair in half
+  // and emit a lone surrogate, producing invalid UTF-8 in the written file.
+  const cut = Array.from(sentence).slice(0, MAX_DESCRIPTION - 1).join("").trimEnd();
+  return `${cut}…`;
 }
 
 export function memoryDir(cwd: string): string {
@@ -2158,10 +2306,18 @@ export function writeMemoryNote(opts: { cwd: string; text: string; type?: string
   }
 
   const path = join(dir, `${slug}.md`);
+  const type = NOTE_TYPES.includes(opts.type as (typeof NOTE_TYPES)[number])
+    ? (opts.type as string)
+    : DEFAULT_NOTE_TYPE;
+  // description is arbitrary user text and MUST be quoted. Unquoted, a colon makes the
+  // frontmatter fail to parse, a leading "-" turns it into a sequence, and a leading "#"
+  // makes the whole value parse as null — silently discarding the description with no
+  // error anywhere. JSON.stringify emits a double-quoted scalar that YAML accepts, with
+  // quotes and backslashes escaped, and it is fully deterministic.
   const content = `---
 name: ${slug}
-description: ${deriveDescription(text)}
-type: ${opts.type ?? "project"}
+description: ${JSON.stringify(deriveDescription(text))}
+type: ${type}
 ---
 
 ${text}
@@ -2291,6 +2447,50 @@ describe("createObserverRunner", () => {
     });
     expect(factory.mock.calls[0]?.[0]).toMatchObject({ tools: ["read"] });
   });
+
+  it("aborts the session when the signal fires and returns null", async () => {
+    const abort = vi.fn(async () => {});
+    let release: () => void = () => {};
+    const factory = vi.fn(async () => ({
+      session: {
+        prompt: vi.fn(() => new Promise<void>((resolve) => { release = resolve; })),
+        abort,
+        dispose: vi.fn(),
+      },
+    }));
+    const runner = await createObserverRunner({
+      def: defOf(), model: { provider: "p", id: "m" }, cwd: "/tmp",
+      agentDir: "/tmp/agent", createSession: factory as never,
+    });
+    const controller = new AbortController();
+    const pending = runner.run({ lastUserMessage: "a" }, controller.signal);
+    controller.abort();
+    // The bridge must have called through to the session; an observer that ignores the
+    // signal keeps burning tokens after the bus has stopped waiting for it.
+    expect(abort).toHaveBeenCalledTimes(1);
+    release();
+    expect(await pending).toBeNull();
+  });
+
+  it("does not accumulate abort listeners across runs", async () => {
+    const abort = vi.fn(async () => {});
+    const factory = vi.fn(async () => ({
+      session: { prompt: vi.fn(async () => {}), abort, dispose: vi.fn() },
+    }));
+    const runner = await createObserverRunner({
+      def: defOf(), model: { provider: "p", id: "m" }, cwd: "/tmp",
+      agentDir: "/tmp/agent", createSession: factory as never,
+    });
+    const controller = new AbortController();
+    // Five completed runs on one signal. The session outlives them all, so a listener
+    // left behind by each run would still be attached.
+    for (let i = 0; i < 5; i++) await runner.run({}, controller.signal);
+    controller.abort();
+    // Each listener is registered { once: true }, so five leaked listeners would fire
+    // five times on this single abort. Exactly zero is correct here: every run already
+    // finished, so every listener should have been removed in its finally block.
+    expect(abort).toHaveBeenCalledTimes(0);
+  });
 });
 ```
 
@@ -2372,6 +2572,20 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
 
   // Hermetic: without these the nested session loads this very extension and
   // recursively spawns observers inside observers.
+  //
+  // Use the TYPED options `systemPrompt` / `appendSystemPrompt`, NOT the
+  // `systemPromptOverride` / `appendSystemPromptOverride` pair. Those two exist in pi's
+  // compiled resource-loader at runtime but are absent from the exported
+  // DefaultResourceLoaderOptions type, so an object literal carrying them fails tsc's
+  // excess-property check — and an undocumented runtime option could disappear in a
+  // later release with no type error to warn us.
+  //
+  // `systemPrompt` is a prompt *source*: pi treats it as a file path when one exists at
+  // that path and as a literal otherwise. Observer prompts are multi-line prose, never a
+  // path, so they resolve as literals. Passing it also suppresses pi's own system-prompt
+  // file discovery, which is the point. `appendSystemPrompt: []` likewise suppresses
+  // discovery of an append-prompt file (an empty array is truthy, so pi skips the
+  // discovery branch); omitting it would let a project's append file leak in.
   const resourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
@@ -2380,8 +2594,8 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    systemPromptOverride: () => systemPrompt,
-    appendSystemPromptOverride: () => [],
+    systemPrompt,
+    appendSystemPrompt: [],
   });
   await resourceLoader.reload();
 
@@ -2410,7 +2624,23 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
       current = createOutputTools(def);
       const rendered = renderSlices(def.sees, state);
       const prompt = rendered === "" ? "Observe now." : `Observe now.\n\n${rendered}`;
-      await session.prompt(prompt);
+
+      // session.prompt() takes no AbortSignal — PromptOptions carries none — so the only
+      // way to cancel an in-flight run is session.abort(). Without this bridge, an
+      // aborted or timed-out observer keeps running and burning tokens: the bus stops
+      // waiting for it, but nothing stops the run itself.
+      const onAbort = () => {
+        void session.abort();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        await session.prompt(prompt);
+      } finally {
+        // Always remove it: the session outlives the run, and a listener per run would
+        // accumulate for the life of the session.
+        signal.removeEventListener("abort", onAbort);
+      }
+      if (signal.aborted) return null;
       return current.collector.take();
     },
     dispose() {
@@ -2508,7 +2738,7 @@ git commit -m "feat: run observers in persistent hermetic nested sessions"
   - `writeGoal(cwd: string, text: string): string` — empty text clears the goal, returning `""`
   - `readGoal(cwd: string): string | undefined`
   - `formatObserverStatus(rows: StatusRow[]): string`
-  - `interface StatusRow { name: string; enabled: boolean; model: string; runs: number; failures: number; disabled: boolean }`
+  - `interface StatusRow { name: string; enabled: boolean; model: string; runs: number; failures: number; disabled: boolean; accepted: number; dropped: number }`
 
 Command *registration* happens in Task 13; this task provides the pure logic those handlers call.
 
@@ -2558,8 +2788,8 @@ describe("formatObserverStatus", () => {
 
   it("lists each observer with model and counts", () => {
     const out = formatObserverStatus([
-      { name: "memory-recall", enabled: true, model: "lunaroute/deepseek-v4-flash", runs: 3, failures: 0, disabled: false },
-      { name: "verification", enabled: false, model: "-", runs: 0, failures: 0, disabled: false },
+      { name: "memory-recall", enabled: true, model: "lunaroute/deepseek-v4-flash", runs: 3, failures: 0, disabled: false, accepted: 2, dropped: 1 },
+      { name: "verification", enabled: false, model: "-", runs: 0, failures: 0, disabled: false, accepted: 0, dropped: 0 },
     ]);
     expect(out).toContain("memory-recall");
     expect(out).toContain("lunaroute/deepseek-v4-flash");
@@ -2567,9 +2797,27 @@ describe("formatObserverStatus", () => {
     expect(out).toMatch(/disabled|off/i);
   });
 
+  it("reports accepted and dropped counts, not just runs", () => {
+    // An observer that runs constantly and has everything dropped is working and
+    // useless; with only a run count it looks identical to a healthy one.
+    const out = formatObserverStatus([
+      { name: "noisy", enabled: true, model: "m", runs: 9, failures: 0, disabled: false, accepted: 0, dropped: 9 },
+    ]);
+    expect(out).toMatch(/0 accepted/);
+    expect(out).toMatch(/9 dropped/);
+  });
+
+  it("shows failures for an observer that is failing but not yet disabled", () => {
+    // Reporting failures only after the disable threshold hides the warning signal.
+    const out = formatObserverStatus([
+      { name: "shaky", enabled: true, model: "m", runs: 5, failures: 2, disabled: false, accepted: 1, dropped: 0 },
+    ]);
+    expect(out).toMatch(/2 failures/);
+  });
+
   it("flags an observer disabled by repeated failures", () => {
     const out = formatObserverStatus([
-      { name: "flaky", enabled: true, model: "m", runs: 3, failures: 3, disabled: true },
+      { name: "flaky", enabled: true, model: "m", runs: 3, failures: 3, disabled: true, accepted: 0, dropped: 0 },
     ]);
     expect(out).toMatch(/failure/i);
   });
@@ -2595,6 +2843,10 @@ export interface StatusRow {
   runs: number;
   failures: number;
   disabled: boolean;
+  /** Proposals this observer had accepted by the reconciler this session. */
+  accepted: number;
+  /** Proposals the reconciler dropped — deduped, over-length, capped, or budget-spent. */
+  dropped: number;
 }
 
 export function goalFilePath(cwd: string): string {
@@ -2637,8 +2889,21 @@ export function formatObserverStatus(rows: StatusRow[]): string {
         : row.enabled
           ? "on"
           : "off";
-      const counts = row.enabled ? ` — ${row.runs} run${row.runs === 1 ? "" : "s"}` : "";
-      return `${row.name} [${state}] ${row.model}${counts}`;
+
+      if (!row.enabled) return `${row.name} [${state}] ${row.model}`;
+
+      // Failures must show even when the observer is still running. An observer failing
+      // intermittently but not yet at the disable threshold is exactly what a user needs
+      // to see, and reporting it only after it is disabled hides the warning signal.
+      const parts = [`${row.runs} run${row.runs === 1 ? "" : "s"}`];
+      if (!row.disabled && row.failures > 0) {
+        parts.push(`${row.failures} failure${row.failures === 1 ? "" : "s"}`);
+      }
+      // The spec requires accepted vs dropped: an observer that runs constantly and has
+      // everything dropped is working and useless, which looks identical to a healthy one
+      // if only the run count is shown.
+      parts.push(`${row.accepted} accepted`, `${row.dropped} dropped`);
+      return `${row.name} [${state}] ${row.model} — ${parts.join(", ")}`;
     })
     .join("\n");
 }
@@ -2835,10 +3100,28 @@ export default function (pi: ExtensionAPI) {
     const mine = all.filter((p) => p.deliver === point || (p.kind === "veto" && point === "settle"));
     // Anything not for this delivery point goes back for a later one.
     for (const proposal of all) if (!mine.includes(proposal)) requeue(proposal);
-    const { advisories, veto } = reconciler.reconcile(mine);
+    const { advisories, veto, dropped } = reconciler.reconcile(mine);
     if (veto) pendingVeto = veto;
+    // Tally per observer for /observers. The reconciler is stateless about who proposed
+    // what across calls, and the bus only counts runs — so an observer that runs
+    // constantly and has everything dropped would otherwise look identical to a healthy
+    // one. This is the only place both outcomes are visible.
+    for (const a of advisories) tallyFor(a.observer).accepted += 1;
+    if (veto) tallyFor(veto.observer).accepted += 1;
+    for (const d of dropped) tallyFor(d.proposal.observer).dropped += 1;
     for (const a of advisories) pi.appendEntry(ACCEPTED_ENTRY, { fingerprint: a.fingerprint });
     return advisories;
+  }
+
+  /** Per-observer accepted/dropped counts for the /observers command. */
+  const tallies = new Map<string, { accepted: number; dropped: number }>();
+  function tallyFor(name: string): { accepted: number; dropped: number } {
+    let t = tallies.get(name);
+    if (!t) {
+      t = { accepted: 0, dropped: 0 };
+      tallies.set(name, t);
+    }
+    return t;
   }
 
   const held: Proposal[] = [];
@@ -3013,6 +3296,7 @@ export default function (pi: ExtensionAPI) {
 
       const rows: StatusRow[] = loaded.map((l) => {
         const status = bus.status(l.def.name);
+        const tally = tallyFor(l.def.name);
         return {
           name: l.def.name,
           enabled: l.active,
@@ -3020,6 +3304,8 @@ export default function (pi: ExtensionAPI) {
           runs: status.runs,
           failures: status.failures,
           disabled: status.disabled,
+          accepted: tally.accepted,
+          dropped: tally.dropped,
         };
       });
       ctx.ui.notify(formatObserverStatus(rows), "info");
@@ -3055,8 +3341,14 @@ export default function (pi: ExtensionAPI) {
 
 // biome-ignore lint/suspicious/noExplicitAny: pi ctx
 function readSettingsBlock(ctx: any): unknown {
+  // SettingsManager has NO generic get(key) accessor — verified against pi 0.83.0.
+  // It exposes getGlobalSettings() / getProjectSettings(), each returning a Settings
+  // object. Project settings override global ones.
   try {
-    return ctx.settingsManager?.get?.("observers");
+    const global = ctx.settingsManager?.getGlobalSettings?.() ?? {};
+    const project = ctx.settingsManager?.getProjectSettings?.() ?? {};
+    const merged = { ...(global.observers ?? {}), ...(project.observers ?? {}) };
+    return Object.keys(merged).length > 0 ? merged : undefined;
   } catch {
     return undefined;
   }
@@ -3087,23 +3379,34 @@ function summarizeArgs(event: any): string {
 Run: `npx vitest run test/index.test.ts && npx tsc --noEmit`
 Expected: PASS
 
-- [ ] **Step 5: Verify the `modelRegistry.getAll` method name against the installed pi**
+- [ ] **Step 5: Model registry and settings APIs — already verified**
 
-Run:
-```bash
-grep -n "getAll\|listModels\|allModels" \
-  "$(npm root -g)/@earendil-works/pi-coding-agent/dist/core/model-registry.d.ts"
-```
-Expected: a method listing every model. If it is named differently, update `modelLookup()` in `src/index.ts` to match, and note the correct name in a comment.
+Both were verified against pi 0.83.0 during planning; the code above already reflects
+the real shapes. Do not change them without re-checking:
 
-- [ ] **Step 6: Verify the settings accessor name**
+- `ModelRegistry.getAll(): Model[]` exists and is what `modelLookup()` uses. There is
+  also `getAvailable()`, which filters to models whose provider is authenticated —
+  consider it if unauthenticated models cause noise, but `getAll()` matches the
+  resolution chain's intent (fall back loudly, not silently).
+- `SettingsManager` has **no** generic `get(key)`. It exposes `getGlobalSettings()`
+  and `getProjectSettings()`, each returning a `Settings` object. `readSettingsBlock()`
+  above merges `observers` off both, project winning.
 
-Run:
-```bash
-grep -n "get\b\|getSettings\|get(" \
-  "$(npm root -g)/@earendil-works/pi-coding-agent/dist/core/settings-manager.d.ts" | head -20
-```
-Expected: an accessor for a settings key. Update `readSettingsBlock()` to match if it differs. Both helpers are already wrapped in try/catch, so a mismatch degrades to defaults rather than crashing — but it must be correct for settings to work at all.
+- [ ] **Step 6: Session-entry shape — already verified**
+
+Verified against pi 0.83.0; `textOfLast()` above already matches the real shapes. For
+reference, so you can check rather than trust:
+
+- `SessionManager.getBranch() / getEntries() / buildContextEntries()` all return
+  `SessionEntry[]`.
+- `SessionMessageEntry` is `{ type: "message", message: AgentMessage }`.
+- `UserMessage.content` is `string | (TextContent | ImageContent)[]` — the string case
+  is real and must be handled.
+- `AssistantMessage.content` is always an array: `(TextContent | ThinkingContent |
+  ToolCall)[]`. Filtering to `type === "text"` is what excludes thinking blocks, which
+  the spec requires. Do not widen that filter.
+- `CustomEntry` is `{ type: "custom", customType: string, data?: T }`, which is what
+  the reconciler-replay scan in `session_start` relies on.
 
 - [ ] **Step 7: Commit**
 
