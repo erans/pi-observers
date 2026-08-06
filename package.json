@@ -1,6 +1,6 @@
 {
   "name": "pi-observers",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "File-defined observer agents for pi: they propose, a reconciler decides.",
   "type": "module",
   "license": "MIT",

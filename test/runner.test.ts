@@ -178,10 +178,31 @@ describe("createObserverRunner", () => {
     expect(await runner.run({}, new AbortController().signal)).toBeNull();
   });
 
-  it("restricts the session to the definition's tools", async () => {
+  it("allowlists the definition's tools PLUS the output tools", async () => {
+    // pi's `tools:` option is an allowlist applied to ALL tools, custom tools
+    // included (agent-session.js filters customTools through isAllowedTool).
+    // Passing only def.tools silently strips `propose`/`veto` from the very
+    // session whose system prompt instructs the model to call them — every run
+    // then "succeeds" with nothing proposed. Caught live, not by any unit test:
+    // the fake factory here does not implement pi's allowlist semantics, so this
+    // test pins the option we pass rather than the filtering pi does with it.
     const factory = fakeSessionFactory(() => {});
     await createObserverRunner({
-      def: defOf({ tools: ["read"] }),
+      def: defOf({ tools: ["read"], can: ["advise", "veto"] }),
+      model: { provider: "p", id: "m" },
+      cwd: "/tmp",
+      agentDir: "/tmp/agent",
+      createSession: factory as never,
+    });
+    expect(factory.mock.calls[0]?.[0]).toMatchObject({
+      tools: ["read", "propose", "veto"],
+    });
+  });
+
+  it("allowlists no output tools when the definition permits none", async () => {
+    const factory = fakeSessionFactory(() => {});
+    await createObserverRunner({
+      def: defOf({ tools: ["read"], can: [] }),
       model: { provider: "p", id: "m" },
       cwd: "/tmp",
       agentDir: "/tmp/agent",

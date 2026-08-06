@@ -158,7 +158,13 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
     sessionManager: SessionManager.inMemory(cwd),
     settingsManager,
     resourceLoader,
-    tools: def.tools,
+    // `tools:` is an ALLOWLIST applied to every tool in the session, custom tools
+    // included — pi filters `customTools` through it before registration. The
+    // output tools' names must therefore be on the list, or `propose`/`veto`
+    // silently vanish from the very session whose system prompt invites them:
+    // the observer reads, concludes, has nothing to call, and every run counts
+    // as a success that proposed nothing.
+    tools: [...def.tools, ...tools.map((t) => t.name)],
     customTools: tools,
   });
 
