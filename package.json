@@ -6,7 +6,7 @@
   "license": "MIT",
   "keywords": ["pi-package", "pi", "pi-extension", "observer", "agent"],
   "dependencies": {
-    "typebox": "^1.3.0"
+    "typebox": "1.3.7"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.83.0",
