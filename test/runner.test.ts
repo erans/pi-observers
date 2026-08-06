@@ -405,9 +405,17 @@ describe("createObserverRunner (exploratory)", () => {
     const h = harness();
     await build(h);
     const opts = h.options();
-    // biome-ignore lint/suspicious/noExplicitAny: reaching past a TS-only `private`
-    // annotation to observe constructor wiring with no public getter available.
-    expect((opts.resourceLoader as any).settingsManager).toBe(opts.settingsManager);
+    // Reaching past a TS-only `private` annotation to observe constructor wiring,
+    // since there is no public getter available.
+    // biome-ignore lint/suspicious/noExplicitAny: see comment above
+    const loaderSettingsManager = (opts.resourceLoader as any).settingsManager;
+    // Without this, a future pi release renaming or truly privatizing the field would
+    // make both sides read `undefined` and `toBe` would still pass — a vacuous pass
+    // for the wrong reason, exactly the bug class this test exists to catch one layer
+    // up. Asserting existence first pins the field name itself, not just the values
+    // read through it.
+    expect(loaderSettingsManager).toBeDefined();
+    expect(loaderSettingsManager).toBe(opts.settingsManager);
   });
 
   it("names itself after the definition", async () => {
