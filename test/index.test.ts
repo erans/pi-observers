@@ -66,6 +66,18 @@ function emitting(name: string, proposal: Proposal | null): ObserverRunner & { r
   return runner;
 }
 
+/** A runner that settles on a later macrotask, like any real model call. */
+function slow(name: string, proposal: Proposal | null): ObserverRunner {
+  return {
+    name,
+    async run() {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return proposal;
+    },
+    dispose() {},
+  };
+}
+
 /** A runner whose run never settles until its AbortSignal fires. */
 function wedged(name: string) {
   let aborted = false;
@@ -1127,6 +1139,223 @@ describe("session_start resets", () => {
     }
     // Budget of 1, not the default 3: the second veto must be refused.
     expect(h.sent).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Status notes: a silent observer must be distinguishable from a broken one
+ * ------------------------------------------------------------------ */
+
+describe("observer status notes", () => {
+  async function status(
+    over: Partial<ObserverDeps>,
+    definition = def({ name: "obs", on: "turn_end" }),
+  ) {
+    const h = harness();
+    const { ctx, notices } = makeCtx({
+      cwd,
+      entries: h.entries,
+      model: { provider: "p", id: "m" },
+    });
+    createExtension(
+      h.pi,
+      deps({ discover: () => ({ observers: [definition], errors: [] }), ...over }),
+    );
+    await fire(h, "session_start", {}, ctx);
+    return {
+      h,
+      ctx,
+      read: async () => {
+        await h.commands.get("observers")?.handler("", ctx);
+        return notices.at(-1)?.message ?? "";
+      },
+    };
+  }
+
+  it("says an observer has not run yet, and names the trigger it waits for", async () => {
+    const s = await status({ createRunner: async () => emitting("obs", null) });
+    expect(await s.read()).toContain("obs: has not run yet (waiting for turn_end)");
+  });
+
+  it("says an observer ran and chose to say nothing", async () => {
+    // The case that was indistinguishable from total failure.
+    const s = await status({ createRunner: async () => emitting("obs", null) });
+    await fire(s.h, "turn_end", {}, s.ctx);
+    await tick();
+    expect(await s.read()).toContain("obs: ran 1 time(s) and proposed nothing");
+  });
+
+  it("reports failures and the last error while the observer is still running", async () => {
+    const failing: ObserverRunner = {
+      name: "obs",
+      async run() {
+        throw new Error("provider returned 429");
+      },
+      dispose() {},
+    };
+    const s = await status({ createRunner: async () => failing });
+    await fire(s.h, "turn_end", {}, s.ctx);
+    await tick();
+    const out = await s.read();
+    expect(out).toContain("1 of 1 runs failed");
+    expect(out).toContain("provider returned 429");
+  });
+
+  it("reports an observer the bus stopped, with the error that stopped it", async () => {
+    // Three consecutive failures disable it. Before this, the only visible trace was
+    // the word "disabled" with no cause anywhere.
+    const failing: ObserverRunner = {
+      name: "obs",
+      async run() {
+        throw new Error("no API key for provider");
+      },
+      dispose() {},
+    };
+    const s = await status({ createRunner: async () => failing });
+    for (let i = 0; i < 3; i++) {
+      await fire(s.h, "turn_end", {}, s.ctx);
+      await tick();
+    }
+    const out = await s.read();
+    expect(out).toContain("obs: STOPPED after 3 consecutive failures");
+    expect(out).toContain("no API key for provider");
+  });
+
+  it("explains why an observer never loaded", async () => {
+    const s = await status({
+      createRunner: async () => {
+        throw new Error("nested session refused to start");
+      },
+    });
+    expect(await s.read()).toContain("obs: not running - nested session refused to start");
+  });
+
+  it("explains an observer disabled by model resolution", async () => {
+    const h = harness();
+    // No session model and no registry match: resolution disables with a reason that
+    // previously reached no surface at all.
+    const { ctx, notices } = makeCtx({ cwd, entries: h.entries });
+    createExtension(
+      h.pi,
+      deps({
+        discover: () => ({ observers: [def({ name: "obs", model: "ghost/x" })], errors: [] }),
+      }),
+    );
+    await fire(h, "session_start", {}, ctx);
+    await h.commands.get("observers")?.handler("", ctx);
+    expect(notices.at(-1)?.message).toMatch(/obs: not running - .*ghost\/x/);
+  });
+
+  it("does not present a wedged observer as a user error", async () => {
+    // D4: "already running" means the previous run timed out and is still wedged.
+    const wedgedRunner: ObserverRunner = {
+      name: "obs",
+      async run() {
+        throw new Error("Observer obs is already running: a previous run has not finished");
+      },
+      dispose() {},
+    };
+    const s = await status({ createRunner: async () => wedgedRunner });
+    await fire(s.h, "turn_end", {}, s.ctx);
+    await tick();
+    const out = await s.read();
+    expect(out).toContain("last error:");
+    expect(out).not.toMatch(/you |your |invalid command|user error/i);
+  });
+
+  it("sanitizes a repo-controlled observer name in its note", async () => {
+    const s = await status(
+      { createRunner: async () => emitting("evil", null) },
+      def({ name: "evil\nobs: STOPPED after 99 consecutive failures", on: "turn_end" }),
+    );
+    const out = await s.read();
+    // The forged text still appears -- it is the observer's actual name -- but only
+    // inline on the name's own row and note, never occupying a line of its own where it
+    // would read as a separate observer's status.
+    const forged = out.split("\n").filter((l) => l.includes("STOPPED"));
+    expect(forged.length).toBeGreaterThan(0);
+    for (const line of forged) expect(line).toContain("evil");
+    expect(out.split("\n").some((l) => l.trimStart().startsWith("obs: STOPPED"))).toBe(false);
+  });
+
+  it("emits no note for a healthy observer that has proposed something", async () => {
+    const s = await status({ createRunner: async () => emitting("obs", p("obs", "advice")) });
+    await fire(s.h, "turn_end", {}, s.ctx);
+    await tick();
+    await fire(s.h, "before_agent_start", {}, s.ctx);
+    const out = await s.read();
+    expect(out).not.toContain("obs: ");
+    expect(out).toContain("1 accepted");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Trigger/delivery timing: an observer is always one occurrence late
+ * ------------------------------------------------------------------ */
+
+describe("kick and drain in the same handler", () => {
+  async function boot(h: Harness, definition: ObserverDefinition, runner: ObserverRunner) {
+    const { ctx } = makeCtx({ cwd, entries: h.entries, model: { provider: "p", id: "m" } });
+    createExtension(
+      h.pi,
+      deps({
+        discover: () => ({ observers: [definition], errors: [] }),
+        createRunner: async () => runner,
+      }),
+    );
+    await fire(h, "session_start", {}, ctx);
+    return ctx;
+  }
+
+  it("cannot deliver a settle proposal on the settle that triggered it", async () => {
+    // This is the shipped goal-tracker and verification configuration verbatim:
+    // `on: agent_settled` with `deliver: settle`. The agent_settled handler kicks the
+    // run and then drains "settle" in the same synchronous body, so the run it just
+    // started cannot possibly be in that drain -- the bus resolves it on a later tick
+    // by design ("an observer must not add latency to a turn"). The veto is therefore
+    // always deferred to the NEXT settle, and in a session with only one settle it is
+    // never delivered at all.
+    const h = harness();
+    const d = def({ name: "goal", on: "agent_settled", can: ["veto"], deliver: "settle" });
+    const veto = p("goal", "the goal is not met", { kind: "veto", deliver: "settle" });
+    const ctx = await boot(h, d, slow("goal", veto));
+
+    await fire(h, "agent_settled", {}, ctx);
+    await tick();
+    expect(h.sent).toHaveLength(0);
+
+    // The next settle picks up the previous settle's veto.
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.message.customType).toBe("observer-veto");
+  });
+
+  it("cannot deliver a next_prompt proposal on the before_agent_start that triggered it", async () => {
+    // The shipped skill-recall configuration: `on: before_agent_start` with
+    // `deliver: next_prompt`. Same shape, same one-occurrence lag.
+    const h = harness();
+    const d = def({ name: "skill", on: "before_agent_start", deliver: "next_prompt" });
+    const ctx = await boot(h, d, slow("skill", p("skill", "use the parser skill")));
+
+    expect(await fire(h, "before_agent_start", {}, ctx)).toBeUndefined();
+    await tick();
+    const second = await fire(h, "before_agent_start", {}, ctx);
+    expect(second?.message?.content).toContain("use the parser skill");
+  });
+
+  it("delivers on the first opportunity when the trigger and the delivery point differ", async () => {
+    // The shipped memory-recall configuration: `on: turn_end` with
+    // `deliver: next_prompt`. Two distinct events, so the run has the whole gap
+    // between them to finish -- this is the only bundled observer whose advice can
+    // land on the very next delivery point.
+    const h = harness();
+    const d = def({ name: "memory", on: "turn_end", deliver: "next_prompt" });
+    const ctx = await boot(h, d, slow("memory", p("memory", "you wrote a note about this")));
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    const result = await fire(h, "before_agent_start", {}, ctx);
+    expect(result?.message?.content).toContain("you wrote a note about this");
   });
 });
 

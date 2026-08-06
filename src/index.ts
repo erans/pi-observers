@@ -419,6 +419,10 @@ const MAX_PENDING_TOOL_ARGS = 200;
 /** Cap on one rendered tool-call argument summary. */
 const MAX_TOOL_ARGS_CHARS = 120;
 
+/** Cap on one rendered status note. Observer names and runner errors both embed
+ *  repo-resident text. */
+const MAX_NOTE_CHARS = 300;
+
 function summarizeArgs(args: unknown): string {
   try {
     const text = typeof args === "string" ? args : JSON.stringify(args ?? {});
@@ -463,6 +467,57 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       tallies.set(name, tally);
     }
     return tally;
+  }
+
+  /**
+   * One line per observer that has something a user must be told, and nothing for the
+   * ones that do not.
+   *
+   * Silence is an observer's normal and correct output, so "working perfectly and had
+   * nothing to say" and "broken on every single run" produce an identical experience:
+   * no advisories, no errors, no notification. A live probe of this extension hit
+   * exactly that -- two turns with an observer instructed never to stay silent produced
+   * no visible output and no way to tell, from outside, whether it had run at all. The
+   * bus already counts runs and failures and keeps the last error; nothing was
+   * rendering them, and `lastError` in particular reached no surface anywhere.
+   *
+   * Per D4: a wedged observer's error reads "already running", which means "timed out
+   * and is still wedged", NOT that the user did something wrong. These lines report it
+   * as a last error and never as user fault.
+   */
+  function observerNotes(): string[] {
+    const notes: string[] = [];
+    for (const entry of loaded) {
+      const name = oneLine(entry.def.name, MAX_OBSERVER_NAME_CODE_POINTS);
+      const status = bus.status(entry.def.name);
+      const tally = tallyFor(entry.def.name);
+      const lastError = oneLine(status.lastError ?? "no detail recorded", MAX_NOTE_CHARS);
+
+      if (status.disabled) {
+        notes.push(
+          `${name}: STOPPED after ${status.failures} consecutive failures; last error: ${lastError}`,
+        );
+      } else if (!entry.active) {
+        // `note` carries the model-resolution reason or the runner build error, neither
+        // of which is rendered anywhere else. Without it "off" is unexplained.
+        notes.push(
+          entry.note === undefined
+            ? `${name}: not running`
+            : `${name}: not running - ${oneLine(entry.note, MAX_NOTE_CHARS)}`,
+        );
+      } else if (status.runs === 0) {
+        notes.push(`${name}: has not run yet (waiting for ${entry.def.on})`);
+      } else if (status.failures > 0) {
+        notes.push(
+          `${name}: ${status.failures} of ${status.runs} runs failed; last error: ${lastError}`,
+        );
+      } else if (tally.accepted === 0 && tally.dropped === 0) {
+        // The line that closes the ambiguity: it ran, it worked, it chose to say
+        // nothing. That is the common and correct outcome.
+        notes.push(`${name}: ran ${status.runs} time(s) and proposed nothing`);
+      }
+    }
+    return notes;
   }
 
   function requeue(proposal: Proposal): void {
@@ -781,7 +836,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       // Refreshed here rather than reused from session_start: /goal can have created or
       // broken the file since. Still user-facing only.
       goalDiagnosis = deps.diagnose(ctx.cwd);
-      const lines = [formatObserverStatus(rows)];
+      const lines = [formatObserverStatus(rows), ...observerNotes()];
       if (goalDiagnosis.state === "unreadable") {
         lines.push(
           `goal: UNREADABLE (${oneLine(goalDiagnosis.detail, MAX_ADVISORY_TEXT_CODE_POINTS)}) \u2014 the goal-tracking observer is behaving as if no goal were set.`,
