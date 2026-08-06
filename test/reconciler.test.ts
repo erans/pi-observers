@@ -4,8 +4,13 @@ import type { Proposal } from "../src/types.ts";
 
 function p(over: Partial<Proposal> = {}): Proposal {
   return {
-    observer: "o", kind: "advisory", text: "t", fingerprint: "fp",
-    priority: 50, deliver: "next_prompt", ...over,
+    observer: "o",
+    kind: "advisory",
+    text: "t",
+    fingerprint: "fp",
+    priority: 50,
+    deliver: "next_prompt",
+    ...over,
   };
 }
 
@@ -96,7 +101,9 @@ describe("Reconciler", () => {
       expect(out.veto?.fingerprint).toBe("shared");
       expect(out.veto?.kind).toBe("veto");
       // But the advisory with same fingerprint should still be considered (veto doesn't add to accepted set)
-      expect(out.advisories.some((a) => a.fingerprint === "shared" && a.kind === "advisory")).toBe(true);
+      expect(out.advisories.some((a) => a.fingerprint === "shared" && a.kind === "advisory")).toBe(
+        true,
+      );
     });
 
     it("veto with same fingerprint on second turn allows advisory again", () => {
@@ -111,6 +118,122 @@ describe("Reconciler", () => {
       expect(second.veto?.fingerprint).toBe("x");
       // The advisory won't appear since we only get one veto per turn
       // but the key is that the veto can appear with same fingerprint
+    });
+  });
+
+  describe("restore: replayed veto spend", () => {
+    it("restores veto spend so a reload does not refund the budget", () => {
+      const r = new Reconciler({ vetoBudget: 2 });
+      r.restore([], [["g", 2]]);
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto).toBeNull();
+    });
+
+    it("leaves budget for a fingerprint spent fewer times than the budget", () => {
+      const r = new Reconciler({ vetoBudget: 2 });
+      r.restore([], [["g", 1]]);
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto?.fingerprint).toBe("g");
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto).toBeNull();
+    });
+
+    it("reports the exhausted veto as dropped, with a reason", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      r.restore([], [["g", 1]]);
+      const out = r.reconcile([p({ kind: "veto", fingerprint: "g" })]);
+      expect(out.dropped).toHaveLength(1);
+      expect(out.dropped[0]?.proposal.fingerprint).toBe("g");
+      expect(out.dropped[0]?.reason).toMatch(/budget/i);
+    });
+
+    it("keeps veto spend per fingerprint, not global", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      r.restore([], [["spent", 1]]);
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "other" })]).veto?.fingerprint).toBe(
+        "other",
+      );
+    });
+
+    it("still works when no veto spend is supplied at all", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      r.restore(["adv"]);
+      expect(r.reconcile([p({ fingerprint: "adv" })]).advisories).toHaveLength(0);
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "adv" })]).veto).not.toBeNull();
+    });
+  });
+
+  describe("restore: replayed state is untrusted input", () => {
+    // Session entries are replayed on every reload and accumulate across sessions, and
+    // the fingerprints in them come off a model tool call with no length limit
+    // anywhere upstream. Unbounded replay is a durable memory-growth vector for a
+    // repo-resident observer definition.
+
+    it("bounds how many fingerprints a replay can add", () => {
+      const r = new Reconciler();
+      const many = Array.from({ length: 5000 }, (_, i) => `fp-${i}`);
+      r.restore(many);
+      expect(r.accepted().length).toBeLessThanOrEqual(1000);
+    });
+
+    it("keeps the most recent fingerprints, not the oldest", () => {
+      // The recently accepted advisory is the one about to be repeated. Keeping the
+      // head would silence dedupe exactly where it matters.
+      const r = new Reconciler();
+      const many = Array.from({ length: 5000 }, (_, i) => `fp-${i}`);
+      r.restore(many);
+      expect(r.accepted()).toContain("fp-4999");
+      expect(r.accepted()).not.toContain("fp-0");
+    });
+
+    it("rejects an over-long fingerprint rather than truncating it", () => {
+      // Truncating would collapse two advisories sharing a long prefix onto one key,
+      // silently suppressing the second. Rejecting only costs a repeated advisory.
+      const r = new Reconciler();
+      const huge = "x".repeat(5000);
+      r.restore([huge]);
+      expect(r.accepted()).toHaveLength(0);
+      expect(r.reconcile([p({ fingerprint: huge })]).advisories).toHaveLength(1);
+    });
+
+    it("ignores blank and non-string fingerprints", () => {
+      const r = new Reconciler();
+      r.restore(["", "   ", null as unknown as string, 42 as unknown as string, "real"]);
+      expect(r.accepted()).toEqual(["real"]);
+    });
+
+    it("bounds how many veto-spend entries a replay can add", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      const many: Array<[string, number]> = Array.from({ length: 5000 }, (_, i) => [`g-${i}`, 1]);
+      r.restore([], many);
+      // Entry 4999 is past the cap, so its budget is untouched and it can still veto.
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "g-4999" })]).veto).not.toBeNull();
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "g-0" })]).veto).toBeNull();
+    });
+
+    it("ignores a spend count that is not a positive integer", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      r.restore(
+        [],
+        [
+          ["a", 0],
+          ["b", -3],
+          ["c", 1.5],
+          ["d", Number.NaN],
+          ["e", "2" as unknown as number],
+        ],
+      );
+      for (const fingerprint of ["a", "b", "c", "d", "e"]) {
+        expect(r.reconcile([p({ kind: "veto", fingerprint })]).veto?.fingerprint).toBe(fingerprint);
+      }
+    });
+
+    it("treats an implausibly high spend count as exhausted", () => {
+      // The clamp itself is NOT pinned by this test and cannot be: `spent >= budget`
+      // behaves identically whether the stored value is the budget or MAX_SAFE_INTEGER,
+      // so clamping is behaviourally equivalent to storing verbatim. It is kept as
+      // storage hygiene only. What this test does pin is the direction of the decision:
+      // an absurd replayed count must refuse the veto, not admit it.
+      const r = new Reconciler({ vetoBudget: 2 });
+      r.restore([], [["g", Number.MAX_SAFE_INTEGER]]);
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto).toBeNull();
     });
   });
 
@@ -190,9 +313,7 @@ describe("Reconciler", () => {
       expect(r.accepted()).toEqual(["high"]);
 
       // Turn 2: re-propose the dropped advisory
-      const turn2 = r.reconcile([
-        p({ fingerprint: "low", priority: 10 }),
-      ]);
+      const turn2 = r.reconcile([p({ fingerprint: "low", priority: 10 })]);
       expect(turn2.advisories.map((a) => a.fingerprint)).toEqual(["low"]);
       expect(turn2.dropped).toHaveLength(0);
       expect(r.accepted()).toContain("low");
@@ -250,21 +371,19 @@ describe("Reconciler", () => {
       expect(turn1.veto?.fingerprint).toBe("shared");
       expect(turn1.veto?.kind).toBe("veto");
       // Advisory should also be delivered since we allow 2 advisories per turn
-      expect(turn1.advisories.some((a) => a.fingerprint === "shared" && a.kind === "advisory")).toBe(true);
+      expect(
+        turn1.advisories.some((a) => a.fingerprint === "shared" && a.kind === "advisory"),
+      ).toBe(true);
       // The advisory is now in the accepted set
 
       // Turn 2: same fingerprint veto should be delivered (veto bypasses dedupe)
-      const turn2 = r.reconcile([
-        p({ kind: "veto", fingerprint: "shared", priority: 50 }),
-      ]);
+      const turn2 = r.reconcile([p({ kind: "veto", fingerprint: "shared", priority: 50 })]);
       // This veto should be delivered because vetoes bypass the accepted-set filter
       expect(turn2.veto?.fingerprint).toBe("shared");
       expect(turn2.veto?.kind).toBe("veto");
 
       // Turn 3: re-propose the advisory (should be deduped)
-      const turn3 = r.reconcile([
-        p({ kind: "advisory", fingerprint: "shared", priority: 50 }),
-      ]);
+      const turn3 = r.reconcile([p({ kind: "advisory", fingerprint: "shared", priority: 50 })]);
       // Advisory should NOT be delivered because it was already accepted in turn1
       expect(turn3.advisories.map((a) => a.fingerprint)).not.toContain("shared");
       expect(turn3.dropped.some((d) => d.reason.match(/already/i))).toBe(true);

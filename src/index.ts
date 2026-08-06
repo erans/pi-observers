@@ -39,9 +39,12 @@ const ACCEPTED_ENTRY = "observers-accepted";
 /**
  * Custom session entry recording one spent veto, keyed by fingerprint.
  *
- * Reconciler.restore() takes fingerprints only, so it can rebuild the accepted-advisory
- * dedupe set but NOT the veto spend counter -- see the veto-budget note on
- * `vetoSpend` below for why that matters and why the gate lives here.
+ * The veto budget is the only thing that stops an unsatisfiable goal from holding a
+ * turn open forever, and the reconciler's spend counter is in-memory: on a /reload or a
+ * resume it comes back empty, so the same unmet goal would buy a fresh budget every
+ * reload with no way out short of clearing the goal. These entries are the durable
+ * half of that counter -- appended on every accepted veto, counted back at
+ * session_start, and handed to Reconciler.restore(), which owns the enforcement.
  */
 const VETO_SPEND_ENTRY = "observers-veto-spend";
 
@@ -408,7 +411,7 @@ const DEFAULT_DEPS: ObserverDeps = {
  * this list for the life of the session. Oldest is discarded first: advice about a turn
  * twenty turns ago is the least useful thing here.
  */
-const MAX_HELD_PROPOSALS = 100;
+export const MAX_HELD_PROPOSALS = 100;
 
 /** Bound on in-flight tool-call arguments awaiting their tool_execution_end. */
 const MAX_PENDING_TOOL_ARGS = 200;
@@ -452,25 +455,6 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
 
   /** Per-observer accepted/dropped counts for the /observers command. */
   const tallies = new Map<string, { accepted: number; dropped: number }>();
-
-  /**
-   * Vetoes spent per fingerprint, replayed from the session on start.
-   *
-   * The veto budget is the only thing that stops an unsatisfiable goal from holding a
-   * turn open forever: goal-tracker vetoes while it judges the declared goal unmet, and
-   * the budget is what eventually lets the agent through. Reconciler keeps its own
-   * spend counter, but `Reconciler.restore()` takes fingerprints only and cannot
-   * rebuild it -- so on a /reload or a session resume the reconciler's counter comes
-   * back at zero and the same unsatisfiable goal buys three more vetoes, every reload,
-   * with no way out short of clearing the goal.
-   *
-   * Rather than widen Reconciler's interface, the budget is enforced here, in front of
-   * it, against a counter persisted as session entries -- the same mechanism the
-   * accepted-fingerprint dedupe already uses, and the only state that survives a reload.
-   * The reconciler's own counter stays as a redundant inner gate; it can only ever fire
-   * at or after this one, so it changes no outcome.
-   */
-  const vetoSpend = new Map<string, number>();
 
   function tallyFor(name: string): { accepted: number; dropped: number } {
     let tally = tallies.get(name);
@@ -532,26 +516,12 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       }
     }
 
-    // Enforce the persisted veto budget BEFORE the reconciler sees the proposal, so a
-    // budget already spent earlier in this session is not silently refunded by a reload.
-    const affordable: Proposal[] = [];
-    for (const proposal of mine) {
-      if (proposal.kind !== "veto") {
-        affordable.push(proposal);
-        continue;
-      }
-      if ((vetoSpend.get(proposal.fingerprint) ?? 0) >= settings.vetoBudget) {
-        tallyFor(proposal.observer).dropped += 1;
-        continue;
-      }
-      affordable.push(proposal);
-    }
-
-    const { advisories, veto, dropped } = reconciler.reconcile(affordable);
+    const { advisories, veto, dropped } = reconciler.reconcile(mine);
     if (veto) {
       pendingVeto = veto;
-      const spent = (vetoSpend.get(veto.fingerprint) ?? 0) + 1;
-      vetoSpend.set(veto.fingerprint, spent);
+      // One entry per accepted veto. session_start counts them back into the spend map
+      // it hands to reconciler.restore(), which is what makes the budget survive a
+      // /reload -- the reconciler's own counter is in-memory and starts empty.
       pi.appendEntry(VETO_SPEND_ENTRY, { fingerprint: veto.fingerprint });
     }
 
@@ -599,10 +569,11 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     turnToolCalls = [];
     pendingToolArgs.clear();
     tallies.clear();
-    vetoSpend.clear();
 
-    // Dedupe and veto spend must both survive /reload and resume.
+    // Dedupe and veto spend must both survive /reload and resume. Both are handed to
+    // the reconciler, which owns the budget and validates what comes off disk.
     const seen: string[] = [];
+    const vetoSpend = new Map<string, number>();
     for (const entry of ctx.sessionManager.getEntries()) {
       // biome-ignore lint/suspicious/noExplicitAny: custom entry shape
       const e = entry as any;
@@ -616,7 +587,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
         vetoSpend.set(key, (vetoSpend.get(key) ?? 0) + 1);
       }
     }
-    reconciler.restore(seen);
+    reconciler.restore(seen, vetoSpend);
 
     goalDiagnosis = deps.diagnose(ctx.cwd);
     if (goalDiagnosis.state === "unreadable" && ctx.hasUI) {
