@@ -208,5 +208,91 @@ describe("createOutputTools", () => {
         });
       });
     });
+
+    // Blank-codepoint validation (round 2 fix): trim() alone does not catch
+    // every blank-looking codepoint. These are written as \uXXXX escapes
+    // rather than pasted invisible characters so the diff stays reviewable.
+    describe("blank codepoint validation", () => {
+      const BLANK_CASES: Array<[string, string]> = [
+        ["U+200B zero-width space", "\u200B"],
+        ["U+2800 Braille pattern blank", "\u2800"],
+        ["U+3164 Hangul filler", "\u3164"],
+        ["U+115F Hangul choseong filler", "\u115F"],
+        ["U+17B4 Khmer inherent vowel", "\u17B4"],
+        ["empty string", ""],
+        ["U+FEFF BOM", "\uFEFF"],
+        ["ordinary space", " "],
+        ["mixed all-blank string", "\u200B\u2800 \t"],
+      ];
+
+      for (const [label, value] of BLANK_CASES) {
+        it(`rejects advisory containing only blank codepoints: ${label}`, async () => {
+          const { tools } = createOutputTools(defOf());
+          await expect(call(tools[0], { advisory: value, fingerprint: "fp" })).rejects.toThrow(
+            /Advisory must be a non-empty string/,
+          );
+        });
+
+        it(`rejects veto reason containing only blank codepoints: ${label}`, async () => {
+          const { tools } = createOutputTools(defOf({ can: ["veto"] }));
+          const vetoTool = tools.find((t) => t.name === "veto")!;
+          await expect(call(vetoTool, { reason: value, fingerprint: "fp" })).rejects.toThrow(
+            /Reason must be a non-empty string/,
+          );
+        });
+
+        it(`rejects fingerprint containing only blank codepoints: ${label}`, async () => {
+          const { tools } = createOutputTools(defOf());
+          await expect(call(tools[0], { advisory: "valid text", fingerprint: value })).rejects.toThrow(
+            /Fingerprint must be a non-empty string/,
+          );
+        });
+      }
+
+      it("accepts advisory with a zero-width space plus real content", async () => {
+        const { tools, collector } = createOutputTools(defOf());
+        await call(tools[0], { advisory: "\u200Bx", fingerprint: "fp" });
+        expect(collector.take()?.text).toBe("\u200Bx");
+      });
+
+      it("accepts advisory with a Braille blank plus real content", async () => {
+        const { tools, collector } = createOutputTools(defOf());
+        await call(tools[0], { advisory: "\u2800ok", fingerprint: "fp" });
+        expect(collector.take()?.text).toBe("\u2800ok");
+      });
+
+      it("accepts ordinary text", async () => {
+        const { tools, collector } = createOutputTools(defOf());
+        await call(tools[0], { advisory: "check the tests", fingerprint: "fp" });
+        expect(collector.take()?.text).toBe("check the tests");
+      });
+
+      it("accepts text containing an emoji", async () => {
+        const { tools, collector } = createOutputTools(defOf({ maxAdvisoryChars: 50 }));
+        await call(tools[0], { advisory: "looks good \u{1F44D}", fingerprint: "fp" });
+        expect(collector.take()?.text).toBe("looks good \u{1F44D}");
+      });
+
+      it("accepts Hebrew text", async () => {
+        const { tools, collector } = createOutputTools(defOf({ maxAdvisoryChars: 50 }));
+        await call(tools[0], { advisory: "שלום", fingerprint: "fp" });
+        expect(collector.take()?.text).toBe("שלום");
+      });
+
+      it("accepts Chinese text", async () => {
+        const { tools, collector } = createOutputTools(defOf({ maxAdvisoryChars: 50 }));
+        await call(tools[0], { advisory: "你好世界", fingerprint: "fp" });
+        expect(collector.take()?.text).toBe("你好世界");
+      });
+
+      it("a rejected blank call does not consume the one-proposal-per-run allowance", async () => {
+        const { tools, collector } = createOutputTools(defOf());
+        await expect(call(tools[0], { advisory: "\u2800", fingerprint: "fp" })).rejects.toThrow();
+        expect(collector.take()).toBeNull();
+        await call(tools[0], { advisory: "valid follow-up", fingerprint: "fp2" });
+        expect(collector.take()?.text).toBe("valid follow-up");
+        expect(collector.warnings).toHaveLength(0);
+      });
+    });
   });
 });

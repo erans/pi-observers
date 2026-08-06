@@ -9,6 +9,17 @@ export interface ProposalCollector {
 }
 
 /**
+ * Matches characters that render as blank: standard whitespace (including
+ * U+0085 NEL, which JavaScript's `\s` does NOT match), Unicode format
+ * characters (\p{Cf}, e.g. U+200B zero-width space, U+FEFF BOM), and a set of
+ * invisible codepoints whose General_Category is NOT Cf so \p{Cf} alone
+ * misses them: U+2800 Braille pattern blank, U+115F/U+1160 Hangul fillers,
+ * U+17B4/U+17B5 Khmer inherent vowels, U+3164 Hangul filler, U+FFA0
+ * halfwidth Hangul filler. The `u` flag is required for \p{...} to work.
+ */
+const BLANK = /[\s\p{Cf}⠀ᅟᅠ឴឵ㅤﾠ]/gu;
+
+/**
  * Build the output tools for one observer run.
  *
  * These are the observer's only means of emitting anything — its prose final
@@ -20,11 +31,14 @@ export function createOutputTools(def: ObserverDefinition) {
   const warnings: string[] = [];
 
   /**
-   * Validate and trim a string field, rejecting empty or whitespace-only values.
+   * Validate and trim a string field, rejecting values that are empty or
+   * whose every character renders as blank (see BLANK above). A string
+   * containing at least one real character is accepted even if it also
+   * contains invisible characters.
    * Mirrors the convention from src/definitions.ts requireString().
    */
   const requireNonEmpty = (value: unknown, fieldName: string): string => {
-    if (typeof value !== "string" || value.trim() === "") {
+    if (typeof value !== "string" || value.replace(BLANK, "") === "") {
       throw new Error(`${fieldName} must be a non-empty string.`);
     }
     return value.trim();
