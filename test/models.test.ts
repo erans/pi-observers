@@ -63,9 +63,9 @@ describe("resolveObserverModel", () => {
 
   it("step 3: same bare id under a different provider", () => {
     const lookup = lookupOf([{ provider: "bedrock", id: "claude-haiku-4-5" }]);
+    // Provider is pinned — must NOT cross to any-provider; falls back to disabled/session.
     const r = resolveObserverModel(defOf({ model: "anthropic/claude-haiku-4-5" }), lookup, {});
-    expect(r).toMatchObject({ status: "resolved", via: "any-provider" });
-    if (r.status === "resolved") expect(r.model.provider).toBe("bedrock");
+    expect(r.status).toBe("disabled");
   });
 
   it("step 4: falls back in listed order", () => {

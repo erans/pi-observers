@@ -13,6 +13,7 @@ export interface BusStatus {
 interface Entry extends BusStatus {
   inflight?: Promise<void>;
   controller?: AbortController;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -56,9 +57,8 @@ export class ProposalBus {
     // then permanently silent, because every later kick hits the in-flight guard —
     // yet status() reports runs: 0, failures: 0, disabled: false. Racing guarantees
     // the failure is counted and the slot is released no matter how the run behaves.
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
+      entry.timer = setTimeout(() => {
         controller.abort(new Error("observer run timed out"));
         reject(new Error("observer run timed out"));
       }, timeoutMs);
@@ -97,7 +97,8 @@ export class ProposalBus {
         if (entry.consecutiveFailures >= this.#maxConsecutive) entry.disabled = true;
       })
       .finally(() => {
-        clearTimeout(timer);
+        clearTimeout(entry.timer);
+        entry.timer = undefined;
         entry.inflight = undefined;
         entry.controller = undefined;
       });
@@ -109,12 +110,14 @@ export class ProposalBus {
   }
 
   status(name: string): BusStatus {
-    const { runs, failures, consecutiveFailures, disabled, lastError } = this.#entry(name);
+    const entry = this.#entries.get(name);
+    if (!entry) return { runs: 0, failures: 0, consecutiveFailures: 0, disabled: false };
+    const { runs, failures, consecutiveFailures, disabled, lastError } = entry;
     return { runs, failures, consecutiveFailures, disabled, lastError };
   }
 
   isDisabled(name: string): boolean {
-    return this.#entry(name).disabled;
+    return this.#entries.get(name)?.disabled ?? false;
   }
 
   abortAll(): void {

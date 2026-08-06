@@ -31,7 +31,13 @@ export interface ProposalCollector {
  * stays unambiguous under any transport that might mangle raw invisible
  * characters.
  */
-const BLANK = /[\s\u0085\p{Cf}\u2800\u115F\u1160\u17B4\u17B5\u3164\uFFA0]/gu;
+export const BLANK = /[\s\u0085\p{Cf}\u2800\u115F\u1160\u17B4\u17B5\u3164\uFFA0]/gu;
+
+export const MAX_FINGERPRINT_LENGTH = 512;
+
+export function isBlank(value: string): boolean {
+  return value.replace(BLANK, "") === "";
+}
 
 /**
  * Build the output tools for one observer run.
@@ -63,6 +69,11 @@ export function createOutputTools(def: ObserverDefinition) {
     // This ensures rejected calls don't consume the observer's one emission.
     const trimmedText = requireNonEmpty(text, kind === "advisory" ? "Advisory" : "Reason");
     const trimmedFingerprint = requireNonEmpty(fingerprint, "Fingerprint");
+    if (trimmedFingerprint.length > MAX_FINGERPRINT_LENGTH) {
+      throw new Error(
+        `Fingerprint is ${trimmedFingerprint.length} chars, which exceeds max ${MAX_FINGERPRINT_LENGTH}.`,
+      );
+    }
 
     if (proposal) {
       warnings.push(`${def.name} already proposed this run; ignoring the extra ${kind}.`);

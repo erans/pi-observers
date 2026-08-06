@@ -1585,7 +1585,7 @@ describe("delivery", () => {
     const { ctx } = await bootWith(h, [d], { obs: runner });
 
     await fire(h, "turn_start", {}, ctx);
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < 500; i++) {
       await fire(
         h,
         "tool_execution_start",
@@ -1606,8 +1606,8 @@ describe("delivery", () => {
       ctx,
     );
     await tick();
-    // The map was full, so `late` was never recorded and its args come through empty.
-    expect(seen.at(-1)?.toolCallsThisTurn?.at(-1)?.args).toBe("");
+    // LRU: map was full, so oldest evicted and `late` is kept (verification bypass fixed).
+    expect(seen.at(-1)?.toolCallsThisTurn?.at(-1)?.args).toContain("LATE");
   });
 
   it("counts dropped proposals against the observer that made them", async () => {

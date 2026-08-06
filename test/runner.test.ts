@@ -72,7 +72,12 @@ describe("buildObserverSystemPrompt", () => {
 
   it("puts the file body first, trimmed", () => {
     const prompt = buildObserverSystemPrompt(defOf({ systemPrompt: "\n\n  Watch memory.  \n\n" }));
-    expect(prompt.startsWith("Watch memory.\n")).toBe(true);
+    // Fixed header now comes first, body is quoted after — prevents prompt injection via body prefix.
+    expect(prompt).toMatch(/You are a background observer/);
+    expect(prompt).toContain("Watch memory.");
+    expect(prompt.indexOf("You are a background observer")).toBeLessThan(
+      prompt.indexOf("Watch memory."),
+    );
   });
 
   it("tells the observer its prose reply is discarded", () => {
