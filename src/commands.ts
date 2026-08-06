@@ -101,11 +101,26 @@ export function readGoal(cwd: string): string | undefined {
  *   \u0085  NEXT LINE (NEL). JavaScript's \s does NOT match it.
  *   \u000B  LINE TABULATION (VT)
  *   \u000C  FORM FEED (FF)
+ *   \u001C  FILE SEPARATOR (FS)
+ *   \u001D  GROUP SEPARATOR (GS)
+ *   \u001E  RECORD SEPARATOR (RS)
  *   \u2028  LINE SEPARATOR
  *   \u2029  PARAGRAPH SEPARATOR
  */
-// biome-ignore lint/suspicious/noControlCharactersInRegex: deliberate line-separator class collapsing attacker-influenceable observer name/model frontmatter into a single status row; removing any codepoint reintroduces status-row forgery via a crafted .pi/observers/*.md file.
-const ROW_LINE_SEPARATORS = /[\r\n\u0085\u000B\u000C\u2028\u2029]+/g;
+// Written as escapes in a string, not as a literal character class: typing these
+// codepoints directly has repeatedly ended up as literal control bytes on disk in this
+// repo, and a literal control character in a regex is also a biome error.
+const ROW_SEPARATOR_CHARS = "\\r\\n\\u0085\\u000B\\u000C\\u001C\\u001D\\u001E\\u2028\\u2029";
+const ROW_LINE_SEPARATORS = new RegExp(
+  // All ten codepoints a terminal, a pager, or a JS engine may treat as a line break.
+  // The three C0 separators (U+001C..U+001E) are the ones most easily forgotten and the
+  // ones a definition author is most likely to reach for precisely because they are:
+  // they are invisible, they are not matched by \s in every tool, and several terminals
+  // render them as a line break. Kept in step with src/index.ts's LINE_SEPARATOR_CHARS
+  // and src/slices.ts.
+  `[${ROW_SEPARATOR_CHARS}]+`,
+  "g",
+);
 
 /**
  * Cap on a rendered name/model after separator collapse, so one observer with an

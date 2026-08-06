@@ -19,8 +19,8 @@ const MAX_RESTORED_ENTRIES = 1000;
  */
 const MAX_FINGERPRINT_LENGTH = 512;
 
-/** The replayed value if it is usable as a dedupe key, else undefined. */
-function validFingerprint(value: unknown): string | undefined {
+/** The replayed value if it is usable as part of a dedupe or spend key, else undefined. */
+function validKeyPart(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   if (trimmed === "" || trimmed.length > MAX_FINGERPRINT_LENGTH) return undefined;
@@ -38,6 +38,32 @@ export interface ReconcilerOptions {
   vetoBudget?: number;
 }
 
+/** One replayed veto, as recorded in the session. */
+export interface VetoSpendEntry {
+  observer: string;
+  fingerprint: string;
+  count: number;
+}
+
+/**
+ * Multiplier turning `vetoBudget` into a per-OBSERVER ceiling on accepted vetoes per
+ * session, independent of fingerprint.
+ *
+ * The fingerprint budget alone does not bound anything. `fingerprint` is a string the
+ * observer's model chooses and `src/outputs.ts` only checks that it is non-blank, so a
+ * model that varies it -- through malice, through a repo-resident `can: [veto]`
+ * definition, or simply by not following the instruction in its prompt -- gets a fresh
+ * budget every time. Measured against this class: a stable fingerprint over 25 drains
+ * yields 3 accepted vetoes; a varying one yields 25. Since every accepted veto reopens
+ * the turn and so produces another trigger, that is an unbounded loop.
+ *
+ * This ceiling is the part that actually terminates it, because it keys on the observer
+ * name, which comes from the definition file and not from the model. Two full budgets
+ * is deliberately loose: it must never interfere with legitimate re-vetoing of distinct
+ * goals within one session, only stop the runaway.
+ */
+const VETO_CEILING_MULTIPLIER = 2;
+
 /**
  * Decides which proposals reach the main agent.
  *
@@ -49,11 +75,23 @@ export class Reconciler {
   readonly #maxAdvisories: number;
   readonly #vetoBudget: number;
   readonly #acceptedFingerprints = new Set<string>();
+  /** Keyed by observer AND fingerprint: one observer must not be able to spend, or
+   *  refill, another's budget by proposing a colliding fingerprint. */
   readonly #vetoSpend = new Map<string, number>();
+  /** Accepted vetoes per observer, whatever fingerprints were used. */
+  readonly #vetoAccepted = new Map<string, number>();
+  readonly #vetoCeiling: number;
 
   constructor(opts: ReconcilerOptions = {}) {
     this.#maxAdvisories = opts.maxAdvisoriesPerTurn ?? DEFAULTS.maxAdvisoriesPerTurn;
     this.#vetoBudget = opts.vetoBudget ?? DEFAULTS.vetoBudget;
+    this.#vetoCeiling = this.#vetoBudget * VETO_CEILING_MULTIPLIER;
+  }
+
+  /** Composite spend key. Built from two separately validated parts, never parsed
+   *  back apart, so an observer name containing the separator is harmless. */
+  static vetoKey(observer: string, fingerprint: string): string {
+    return `${observer}:${fingerprint}`;
   }
 
   /**
@@ -71,20 +109,27 @@ export class Reconciler {
    * observer definition can grow this reconciler's memory footprint session over
    * session, permanently.
    */
-  restore(fingerprints: string[], vetoSpend?: Iterable<[string, number]>): void {
+  restore(fingerprints: string[], vetoSpend?: Iterable<VetoSpendEntry>): void {
     // Keep the MOST RECENT entries, not the first: session entries arrive in order,
     // and a recently accepted advisory is the one an observer is about to repeat.
     // Dropping the tail would silence dedupe exactly where it earns its keep.
     for (const fp of fingerprints.slice(-MAX_RESTORED_ENTRIES)) {
-      const key = validFingerprint(fp);
+      const key = validKeyPart(fp);
       if (key !== undefined) this.#acceptedFingerprints.add(key);
     }
 
     if (!vetoSpend) return;
-    for (const [fp, count] of vetoSpend) {
+    for (const entry of vetoSpend) {
       if (this.#vetoSpend.size >= MAX_RESTORED_ENTRIES) break;
-      const key = validFingerprint(fp);
-      if (key === undefined) continue;
+      // BOTH parts are validated, not just the fingerprint. The key is what bounds this
+      // map, so an unvalidated observer name reopens exactly the growth vector the
+      // fingerprint check closes -- and `observer` is frontmatter from a repo-resident
+      // definition, which is if anything the more attacker-controlled of the two.
+      const observer = validKeyPart(entry?.observer);
+      const fingerprint = validKeyPart(entry?.fingerprint);
+      if (observer === undefined || fingerprint === undefined) continue;
+      const key = Reconciler.vetoKey(observer, fingerprint);
+      const count = entry.count;
       if (typeof count !== "number" || !Number.isInteger(count) || count <= 0) continue;
       // An implausible count is clamped, not rejected: at or above the budget means
       // "exhausted", which is the safe direction. The failure mode of a forged high
@@ -97,7 +142,14 @@ export class Reconciler {
       // way whether the stored value is the budget or MAX_SAFE_INTEGER, so clamping is
       // behaviourally equivalent to storing the value verbatim. No test pins it, and
       // none can.
-      this.#vetoSpend.set(key, Math.min(count, this.#vetoBudget));
+      const spent = Math.min(count, this.#vetoBudget);
+      this.#vetoSpend.set(key, spent);
+      // The per-observer ceiling is replayed too, or a reload refills it and the
+      // runaway it exists to stop resumes with a clean slate.
+      this.#vetoAccepted.set(
+        observer,
+        Math.min((this.#vetoAccepted.get(observer) ?? 0) + spent, this.#vetoCeiling),
+      );
     }
   }
 
@@ -159,7 +211,8 @@ export class Reconciler {
         });
         continue;
       }
-      const spent = this.#vetoSpend.get(candidate.fingerprint) ?? 0;
+      const key = Reconciler.vetoKey(candidate.observer, candidate.fingerprint);
+      const spent = this.#vetoSpend.get(key) ?? 0;
       if (spent >= this.#vetoBudget) {
         dropped.push({
           proposal: candidate,
@@ -167,7 +220,21 @@ export class Reconciler {
         });
         continue;
       }
-      this.#vetoSpend.set(candidate.fingerprint, spent + 1);
+      // The fingerprint budget bounds nothing on its own: the fingerprint is chosen by
+      // the observer's model, so varying it yields a fresh budget every drain, and every
+      // accepted veto reopens the turn and produces another trigger. This ceiling keys
+      // on the observer name, which comes from the definition file rather than the
+      // model, and is what actually terminates that loop.
+      const acceptedByObserver = this.#vetoAccepted.get(candidate.observer) ?? 0;
+      if (acceptedByObserver >= this.#vetoCeiling) {
+        dropped.push({
+          proposal: candidate,
+          reason: `observer "${candidate.observer}" reached its ceiling of ${this.#vetoCeiling} vetoes this session`,
+        });
+        continue;
+      }
+      this.#vetoSpend.set(key, spent + 1);
+      this.#vetoAccepted.set(candidate.observer, acceptedByObserver + 1);
       veto = candidate;
     }
 

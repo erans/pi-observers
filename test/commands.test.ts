@@ -396,6 +396,12 @@ describe("formatObserverStatus — row forgery via name/model", () => {
     FF: "\u000C",
     LS: "\u2028",
     PS: "\u2029",
+    // The C0 information separators. Invisible, not matched by \s in every tool, and
+    // rendered as a line break by several terminals -- which makes them the ones a
+    // forger would reach for and the ones a maintainer would forget.
+    FS: "\u001C",
+    GS: "\u001D",
+    RS: "\u001E",
   };
 
   for (const [label, sep] of Object.entries(SEPARATORS)) {

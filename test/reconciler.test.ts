@@ -124,20 +124,20 @@ describe("Reconciler", () => {
   describe("restore: replayed veto spend", () => {
     it("restores veto spend so a reload does not refund the budget", () => {
       const r = new Reconciler({ vetoBudget: 2 });
-      r.restore([], [["g", 2]]);
+      r.restore([], [{ observer: "o", fingerprint: "g", count: 2 }]);
       expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto).toBeNull();
     });
 
     it("leaves budget for a fingerprint spent fewer times than the budget", () => {
       const r = new Reconciler({ vetoBudget: 2 });
-      r.restore([], [["g", 1]]);
+      r.restore([], [{ observer: "o", fingerprint: "g", count: 1 }]);
       expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto?.fingerprint).toBe("g");
       expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto).toBeNull();
     });
 
     it("reports the exhausted veto as dropped, with a reason", () => {
       const r = new Reconciler({ vetoBudget: 1 });
-      r.restore([], [["g", 1]]);
+      r.restore([], [{ observer: "o", fingerprint: "g", count: 1 }]);
       const out = r.reconcile([p({ kind: "veto", fingerprint: "g" })]);
       expect(out.dropped).toHaveLength(1);
       expect(out.dropped[0]?.proposal.fingerprint).toBe("g");
@@ -146,7 +146,7 @@ describe("Reconciler", () => {
 
     it("keeps veto spend per fingerprint, not global", () => {
       const r = new Reconciler({ vetoBudget: 1 });
-      r.restore([], [["spent", 1]]);
+      r.restore([], [{ observer: "o", fingerprint: "spent", count: 1 }]);
       expect(r.reconcile([p({ kind: "veto", fingerprint: "other" })]).veto?.fingerprint).toBe(
         "other",
       );
@@ -157,6 +157,77 @@ describe("Reconciler", () => {
       r.restore(["adv"]);
       expect(r.reconcile([p({ fingerprint: "adv" })]).advisories).toHaveLength(0);
       expect(r.reconcile([p({ kind: "veto", fingerprint: "adv" })]).veto).not.toBeNull();
+    });
+  });
+
+  describe("veto ceiling: the fingerprint budget is not a bound", () => {
+    it("stops a veto loop that varies its fingerprint every drain", () => {
+      // The measured defect: the per-fingerprint budget keys on a string the observer's
+      // model chooses, so varying it buys a fresh budget on every drain. With 25 drains
+      // a stable fingerprint yields 3 accepted vetoes and a varying one yielded 25 --
+      // and since each accepted veto reopens the turn, that is an unbounded loop.
+      const r = new Reconciler({ vetoBudget: 3 });
+      let accepted = 0;
+      for (let drain = 0; drain < 25; drain++) {
+        if (r.reconcile([p({ kind: "veto", fingerprint: `varies-${drain}` })]).veto) accepted += 1;
+      }
+      expect(accepted).toBe(6); // vetoBudget * 2, the per-observer ceiling
+    });
+
+    it("still allows the full per-fingerprint budget for a stable fingerprint", () => {
+      const r = new Reconciler({ vetoBudget: 3 });
+      let accepted = 0;
+      for (let drain = 0; drain < 25; drain++) {
+        if (r.reconcile([p({ kind: "veto", fingerprint: "stable" })]).veto) accepted += 1;
+      }
+      expect(accepted).toBe(3);
+    });
+
+    it("applies the ceiling per observer, not globally", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      for (let i = 0; i < 5; i++) {
+        r.reconcile([p({ kind: "veto", observer: "noisy", fingerprint: `f${i}` })]);
+      }
+      expect(
+        r.reconcile([p({ kind: "veto", observer: "noisy", fingerprint: "new" })]).veto,
+      ).toBeNull();
+      // A different observer is unaffected.
+      expect(
+        r.reconcile([p({ kind: "veto", observer: "quiet", fingerprint: "new" })]).veto,
+      ).not.toBeNull();
+    });
+
+    it("reports a ceilinged veto as dropped, naming the observer", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      r.reconcile([p({ kind: "veto", fingerprint: "a" })]);
+      r.reconcile([p({ kind: "veto", fingerprint: "b" })]);
+      const out = r.reconcile([p({ kind: "veto", fingerprint: "c" })]);
+      expect(out.veto).toBeNull();
+      expect(out.dropped[0]?.reason).toMatch(/ceiling/i);
+      expect(out.dropped[0]?.reason).toContain("o");
+    });
+
+    it("does not let one observer spend another's budget via a colliding fingerprint", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      expect(
+        r.reconcile([p({ kind: "veto", observer: "a", fingerprint: "same" })]).veto,
+      ).not.toBeNull();
+      // Same fingerprint, different observer: its own budget is untouched.
+      expect(
+        r.reconcile([p({ kind: "veto", observer: "b", fingerprint: "same" })]).veto,
+      ).not.toBeNull();
+    });
+
+    it("replays the ceiling, so a reload does not refill it", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      r.restore(
+        [],
+        [
+          { observer: "o", fingerprint: "a", count: 1 },
+          { observer: "o", fingerprint: "b", count: 1 },
+        ],
+      );
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "fresh" })]).veto).toBeNull();
     });
   });
 
@@ -199,13 +270,58 @@ describe("Reconciler", () => {
       expect(r.accepted()).toEqual(["real"]);
     });
 
-    it("bounds how many veto-spend entries a replay can add", () => {
+    it("rejects an over-long fingerprint on the veto-spend key too", () => {
+      // The key is what bounds the spend map, so validating only the first restore
+      // argument leaves the same growth vector open on the second.
       const r = new Reconciler({ vetoBudget: 1 });
-      const many: Array<[string, number]> = Array.from({ length: 5000 }, (_, i) => [`g-${i}`, 1]);
+      const huge = "x".repeat(5000);
+      r.restore([], [{ observer: "o", fingerprint: huge, count: 1 }]);
+      // The key was rejected, so no spend was recorded and the veto is still affordable.
+      expect(r.reconcile([p({ kind: "veto", fingerprint: huge })]).veto).not.toBeNull();
+    });
+
+    it("rejects an over-long observer name on the veto-spend key", () => {
+      // `observer` is frontmatter from a repo-resident definition -- if anything the
+      // more attacker-controlled half of the key.
+      const r = new Reconciler({ vetoBudget: 1 });
+      const huge = "o".repeat(5000);
+      r.restore([], [{ observer: huge, fingerprint: "g", count: 1 }]);
+      expect(
+        r.reconcile([p({ kind: "veto", observer: huge, fingerprint: "g" })]).veto,
+      ).not.toBeNull();
+    });
+
+    it("rejects blank and non-string parts of the veto-spend key", () => {
+      const r = new Reconciler({ vetoBudget: 1 });
+      r.restore(
+        [],
+        [
+          { observer: "   ", fingerprint: "g", count: 1 },
+          { observer: "o", fingerprint: "", count: 1 },
+          { observer: 42 as unknown as string, fingerprint: "g", count: 1 },
+          { observer: "o", fingerprint: null as unknown as string, count: 1 },
+        ],
+      );
+      // Nothing was restored, so a fresh veto is still affordable.
+      expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto).not.toBeNull();
+    });
+
+    it("bounds how many veto-spend entries a replay can add", () => {
+      // Distinct observers, so the per-observer ceiling does not mask the map cap.
+      const r = new Reconciler({ vetoBudget: 1 });
+      const many = Array.from({ length: 5000 }, (_, i) => ({
+        observer: `obs-${i}`,
+        fingerprint: "g",
+        count: 1,
+      }));
       r.restore([], many);
       // Entry 4999 is past the cap, so its budget is untouched and it can still veto.
-      expect(r.reconcile([p({ kind: "veto", fingerprint: "g-4999" })]).veto).not.toBeNull();
-      expect(r.reconcile([p({ kind: "veto", fingerprint: "g-0" })]).veto).toBeNull();
+      expect(
+        r.reconcile([p({ kind: "veto", observer: "obs-4999", fingerprint: "g" })]).veto,
+      ).not.toBeNull();
+      expect(
+        r.reconcile([p({ kind: "veto", observer: "obs-0", fingerprint: "g" })]).veto,
+      ).toBeNull();
     });
 
     it("ignores a spend count that is not a positive integer", () => {
@@ -213,15 +329,18 @@ describe("Reconciler", () => {
       r.restore(
         [],
         [
-          ["a", 0],
-          ["b", -3],
-          ["c", 1.5],
-          ["d", Number.NaN],
-          ["e", "2" as unknown as number],
+          { observer: "o", fingerprint: "a", count: 0 },
+          { observer: "o", fingerprint: "b", count: -3 },
+          { observer: "o", fingerprint: "c", count: 1.5 },
+          { observer: "o", fingerprint: "d", count: Number.NaN },
+          { observer: "o", fingerprint: "e", count: "2" as unknown as number },
         ],
       );
+      // One observer each, so the per-observer ceiling cannot mask the count validation.
       for (const fingerprint of ["a", "b", "c", "d", "e"]) {
-        expect(r.reconcile([p({ kind: "veto", fingerprint })]).veto?.fingerprint).toBe(fingerprint);
+        expect(
+          r.reconcile([p({ kind: "veto", observer: fingerprint, fingerprint })]).veto?.fingerprint,
+        ).toBe(fingerprint);
       }
     });
 
@@ -232,7 +351,7 @@ describe("Reconciler", () => {
       // storage hygiene only. What this test does pin is the direction of the decision:
       // an absurd replayed count must refuse the veto, not admit it.
       const r = new Reconciler({ vetoBudget: 2 });
-      r.restore([], [["g", Number.MAX_SAFE_INTEGER]]);
+      r.restore([], [{ observer: "o", fingerprint: "g", count: Number.MAX_SAFE_INTEGER }]);
       expect(r.reconcile([p({ kind: "veto", fingerprint: "g" })]).veto).toBeNull();
     });
   });

@@ -73,7 +73,25 @@ needs to finish. A `can: [veto]` observer must never trigger on its own delivery
 
 `tool_calls_this_turn` accumulates over a whole agent run (your request through the
 agent's final answer), not one model round-trip, so an observer reading it at
-`turn_end` sees everything the agent has done so far in that run.
+`turn_end` sees everything the agent has done so far in that run. It is reset when you
+send a new request. It is **not** reset when an accepted veto reopens a turn: that path
+resumes the existing run rather than starting a new one, so the redo's tool calls are
+appended to the ones that preceded the veto. An observer judging a post-veto redo sees
+the whole run including the vetoed attempt, which is usually what you want and is worth
+knowing if you write a prompt that counts calls.
+
+#### Known limitation: a `goal-tracker` veto can arrive after the work is done
+
+`goal-tracker` triggers on `turn_end` and delivers at `settle`, which keeps it off its
+own delivery point -- but it is still racing the agent. Its veto lands on the first
+`settle` that follows its model call, and if the agent finishes the rest of its work
+faster than that call takes, the veto arrives after the run is over. It then reopens the
+turn and the agent addresses the unmet goal a beat later than it could have.
+
+The residual is *latency, not incorrectness*: what arrives late is a veto that was true
+when it was formed and is still true now, since the goal is still unmet. It never sends
+the agent back over work it had rightly moved past. Closing it entirely would mean
+blocking the turn on a model call, which the design refuses for every observer.
 
 #### Known limitation: `skill-recall` advises the next request
 

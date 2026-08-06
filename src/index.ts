@@ -18,7 +18,7 @@ import {
 import { discoverObservers } from "./discovery.ts";
 import { writeMemoryNote } from "./memory.ts";
 import { type ModelLike, type ModelLookup, resolveObserverModel } from "./models.ts";
-import { Reconciler } from "./reconciler.ts";
+import { Reconciler, type VetoSpendEntry } from "./reconciler.ts";
 import { createObserverRunner, type ObserverRunner } from "./runner.ts";
 import { isObserverEnabled, type ObserverSettings, parseSettings } from "./settings.ts";
 import type {
@@ -39,12 +39,18 @@ const ACCEPTED_ENTRY = "observers-accepted";
 /**
  * Custom session entry recording one spent veto, keyed by fingerprint.
  *
- * The veto budget is the only thing that stops an unsatisfiable goal from holding a
- * turn open forever, and the reconciler's spend counter is in-memory: on a /reload or a
- * resume it comes back empty, so the same unmet goal would buy a fresh budget every
- * reload with no way out short of clearing the goal. These entries are the durable
- * half of that counter -- appended on every accepted veto, counted back at
- * session_start, and handed to Reconciler.restore(), which owns the enforcement.
+ * What actually stops an unsatisfiable goal from holding a turn open forever is the
+ * reconciler's PER-OBSERVER veto ceiling, not the per-fingerprint budget: the
+ * fingerprint is a string the observer's model chooses, so varying it buys a fresh
+ * budget on every drain (measured: 3 accepted vetoes with a stable fingerprint over 25
+ * drains, 25 with a varying one). The ceiling keys on the observer name, which comes
+ * from the definition file.
+ *
+ * Both counters are in-memory, so on a /reload or resume they come back empty and the
+ * loop resumes with a clean slate. These entries are their durable half -- appended on
+ * every accepted veto, counted back at session_start, and handed to
+ * Reconciler.restore(), which owns the enforcement. The observer name is recorded
+ * alongside the fingerprint because the spend key is now built from both.
  */
 const VETO_SPEND_ENTRY = "observers-veto-spend";
 
@@ -580,7 +586,10 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       // One entry per accepted veto. session_start counts them back into the spend map
       // it hands to reconciler.restore(), which is what makes the budget survive a
       // /reload -- the reconciler's own counter is in-memory and starts empty.
-      pi.appendEntry(VETO_SPEND_ENTRY, { fingerprint: veto.fingerprint });
+      pi.appendEntry(VETO_SPEND_ENTRY, {
+        fingerprint: veto.fingerprint,
+        observer: veto.observer,
+      });
     }
 
     // Tally per observer for /observers. The reconciler is stateless about who proposed
@@ -631,7 +640,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     // Dedupe and veto spend must both survive /reload and resume. Both are handed to
     // the reconciler, which owns the budget and validates what comes off disk.
     const seen: string[] = [];
-    const vetoSpend = new Map<string, number>();
+    const vetoSpend = new Map<string, VetoSpendEntry>();
     for (const entry of ctx.sessionManager.getEntries()) {
       // biome-ignore lint/suspicious/noExplicitAny: custom entry shape
       const e = entry as any;
@@ -640,12 +649,20 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       if (fingerprint === undefined || fingerprint === null) continue;
       if (e.customType === ACCEPTED_ENTRY) {
         seen.push(String(fingerprint));
-      } else if (e.customType === VETO_SPEND_ENTRY) {
-        const key = String(fingerprint);
-        vetoSpend.set(key, (vetoSpend.get(key) ?? 0) + 1);
+      } else if (e.customType === VETO_SPEND_ENTRY && typeof e.data?.observer === "string") {
+        // Entries without an observer are from a pre-release entry format and are
+        // skipped rather than guessed at: a wrong observer would spend, or refill,
+        // the wrong ceiling.
+        const key = `${e.data.observer}\u0000${String(fingerprint)}`;
+        const seenSoFar = vetoSpend.get(key);
+        vetoSpend.set(key, {
+          observer: e.data.observer,
+          fingerprint: String(fingerprint),
+          count: (seenSoFar?.count ?? 0) + 1,
+        });
       }
     }
-    reconciler.restore(seen, vetoSpend);
+    reconciler.restore(seen, vetoSpend.values());
 
     goalDiagnosis = deps.diagnose(ctx.cwd);
     if (goalDiagnosis.state === "unreadable" && ctx.hasUI) {
@@ -745,6 +762,16 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     // checking claims against the tool record, was handed an empty record at exactly
     // the moment it mattered. Accumulating across the run is what the slice name means
     // to a user and what every observer prompt assumes.
+    //
+    // This is the ONLY reset, and it is not a general run boundary. Verified in
+    // pi-coding-agent's agent-session.js: emitBeforeAgentStart is called from exactly
+    // one place, prompt(). An accepted veto reaches the agent through
+    // sendCustomMessage({triggerTurn:true}), whose branch calls _runAgentPrompt
+    // directly and emits no before_agent_start -- so a veto-triggered redo ACCUMULATES
+    // onto the tool calls that preceded the veto rather than starting clean. That is
+    // the behaviour we want (an observer judging the redo should see the vetoed attempt
+    // that provoked it), but it is not what "resets per agent run" would lead you to
+    // expect, so it is stated rather than left to be rediscovered.
     turnToolCalls = [];
     pendingToolArgs.clear();
     kickAll("before_agent_start", ctx);

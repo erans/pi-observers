@@ -54,7 +54,12 @@ describe("bundled observers", () => {
     });
     // Both moved off `agent_settled`. See SELF_DRAINING_TRIGGERS below for why.
     expect(byName["goal-tracker"]).toMatchObject({ on: "turn_end", deliver: "settle" });
-    expect(byName.verification).toMatchObject({ on: "turn_end", deliver: "settle" });
+    // verification reads the agent's FINAL message, which only exists at agent_settled:
+    // the last turn_end is followed by agent_settled within microseconds, so a turn_end
+    // trigger always delivers a proposal formed from some earlier, mid-run message.
+    // It advises rather than vetoes, so next_prompt (drained at before_agent_start) is
+    // both correct and the earliest point the advice can be used.
+    expect(byName.verification).toMatchObject({ on: "agent_settled", deliver: "next_prompt" });
   });
 
   /**
@@ -81,7 +86,13 @@ describe("bundled observers", () => {
     for (const o of load().observers) {
       if (!o.can.includes("veto")) continue;
       checked += 1;
-      expect(SELF_DRAINING_TRIGGERS[o.on]).not.toBe(o.deliver);
+      // What matters is where the proposal is ACTUALLY drained, not what `deliver:`
+      // says. src/index.ts routes every veto to `settle` regardless of the definition
+      // (a veto is only actionable while the turn can still be reopened), so an
+      // `on: agent_settled` veto-capable observer is self-draining whatever `deliver`
+      // claims -- and reading `o.deliver` here would wave it through.
+      const effectiveDeliver = o.can.includes("veto") ? "settle" : o.deliver;
+      expect(SELF_DRAINING_TRIGGERS[o.on]).not.toBe(effectiveDeliver);
     }
     // Without this the test passes by checking nothing the day someone drops the last
     // veto-capable observer.
