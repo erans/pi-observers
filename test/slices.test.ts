@@ -931,39 +931,57 @@ describe("renderSlices: N1 type-level bypass resistance", () => {
   const BS = String.fromCharCode(92); // backslash
   const NL2 = cat(BS, "n", BS, "n"); // the source text: backslash n backslash n
 
-  /** The line every edit replaces, and the array the push edits mutate. */
+  /** The line most edits replace, and the array the push edits mutate. */
   const RETURN_LINE = "  return document([renderPreamble(marker), ...sections]);";
   const SECTIONS_LINE = "  const sections: Sanitized[] = contents.map(({ slice, content }) =>";
+  /**
+   * The single named exit the whole N1 fix rests on. Widening this parameter to
+   * `string` is strictly more permissive, so the one call site raises no objection
+   * and the edit compiles silently -- it reopens the assembly to raw strings while
+   * reading as a tidy-up. The compile-time pin next to it in the source is what
+   * turns that into an error, and this case is what stops the pin being deleted.
+   */
+  const UNBRAND_LINE = "function unbrand(value: Sanitized): string {";
 
-  /** [label, replacement source for RETURN_LINE] -- all of these MUST fail tsc. */
-  const BYPASS: Array<readonly [string, string]> = [
+  /**
+   * [label, anchor line, replacement for it] -- all of these MUST fail tsc.
+   * Most target the final return; the last targets the unbrand signature.
+   */
+  const BYPASS: Array<readonly [string, string, string]> = [
     // The seven from the spec, expressed through the new document() helper.
     [
       "extra element appended to the document array",
+      RETURN_LINE,
       'return document([renderPreamble(marker), ...sections, state.newField ?? ""]);',
     ],
     [
       "concatenated onto the finished document",
+      RETURN_LINE,
       'return document([renderPreamble(marker), ...sections]) + (state.newField ?? "");',
     ],
     [
       "extra element spliced before the sections",
+      RETURN_LINE,
       'return document([renderPreamble(marker), state.newField ?? "", ...sections]);',
     ],
     [
       "appended with String.prototype.concat",
+      RETURN_LINE,
       'return document([renderPreamble(marker), ...sections]).concat(state.newField ?? "");',
     ],
     [
       "assembled with + instead of the helper",
+      RETURN_LINE,
       'return renderPreamble(marker) + (state.newField ?? "") + document(sections);',
     ],
     [
       "pushed onto the sections array",
+      RETURN_LINE,
       'sections.push(state.newField ?? ""); return document([renderPreamble(marker), ...sections]);',
     ],
     [
       "placed ABOVE the preamble via a raw header",
+      RETURN_LINE,
       'const hdr = "NOTE: " + (state.newField ?? ""); return document([hdr, renderPreamble(marker), ...sections]);',
     ],
 
@@ -971,10 +989,12 @@ describe("renderSlices: N1 type-level bypass resistance", () => {
     // what the round-3 code actually ended in.
     [
       "verbatim 1: join with an extra element",
+      RETURN_LINE,
       cat('return [renderPreamble(marker), ...sections, state.newField ?? ""].join("', NL2, '");'),
     ],
     [
       "verbatim 2: template literal after the join",
+      RETURN_LINE,
       cat(
         "return ",
         BQ,
@@ -990,10 +1010,12 @@ describe("renderSlices: N1 type-level bypass resistance", () => {
     ],
     [
       "verbatim 3: join with the element spliced in front",
+      RETURN_LINE,
       cat('return [renderPreamble(marker), state.newField ?? "", ...sections].join("', NL2, '");'),
     ],
     [
       "verbatim 4: concat after the join",
+      RETURN_LINE,
       cat(
         'return [renderPreamble(marker), ...sections].join("',
         NL2,
@@ -1002,10 +1024,12 @@ describe("renderSlices: N1 type-level bypass resistance", () => {
     ],
     [
       "verbatim 5: + instead of join",
+      RETURN_LINE,
       cat('return renderPreamble(marker) + (state.newField ?? "") + sections.join("', NL2, '");'),
     ],
     [
       "verbatim 6: unshift onto the sections array",
+      RETURN_LINE,
       cat(
         'sections.unshift(state.newField ?? ""); return [renderPreamble(marker), ...sections].join("',
         NL2,
@@ -1014,22 +1038,35 @@ describe("renderSlices: N1 type-level bypass resistance", () => {
     ],
     [
       "verbatim 7: raw header above the preamble, joined",
+      RETURN_LINE,
       'const hdr = "NOTE: " + (state.newField ?? ""); return [hdr, renderPreamble(marker), ...sections].join("' +
         NL2 +
         '");',
     ],
+    [
+      "unbrand widened to accept a plain string",
+      UNBRAND_LINE,
+      "function unbrand(value: string): string {",
+    ],
   ];
 
   /** These MUST still compile: proof the harness is not simply rejecting everything. */
-  const ALLOWED: Array<readonly [string, string]> = [
-    ["unedited control", RETURN_LINE.trim()],
+  const ALLOWED: Array<readonly [string, string, string]> = [
+    ["unedited control", RETURN_LINE, RETURN_LINE.trim()],
     [
       "a properly sanitized extra element",
+      RETURN_LINE,
       'return document([renderPreamble(marker), ...sections, literal("a note")]);',
     ],
     [
       "a sanitized field, correctly routed",
+      RETURN_LINE,
       'return document([renderPreamble(marker), ...sections, sanitizeMultiLine(state.newField ?? "", 100)]);',
+    ],
+    [
+      "unbrand narrowed further than it already is",
+      UNBRAND_LINE,
+      "function unbrand(value: Sanitized & { readonly extra?: never }): string {",
     ],
   ];
 
@@ -1050,19 +1087,30 @@ describe("renderSlices: N1 type-level bypass resistance", () => {
     fs.writeFileSync(path.join(dir, "types.ts"), patchedTypes);
 
     const files: Array<{ name: string; label: string; mustCompile: boolean }> = [];
-    const write = (label: string, edit: string, mustCompile: boolean, i: number) => {
+    const write = (
+      label: string,
+      anchor: string,
+      edit: string,
+      mustCompile: boolean,
+      i: number,
+    ) => {
       const name = `${mustCompile ? "ok" : "bad"}${i}.ts`;
-      const body =
-        edit === RETURN_LINE.trim() ? slicesSrc : slicesSrc.replace(RETURN_LINE, `  ${edit}`);
-      expect(body).toContain(edit === RETURN_LINE.trim() ? RETURN_LINE : edit);
+      // The unedited control names the return line as its own replacement.
+      const unedited = edit === RETURN_LINE.trim() && anchor === RETURN_LINE;
+      const indent = anchor.startsWith("  ") ? "  " : "";
+      const body = unedited ? slicesSrc : slicesSrc.replace(anchor, `${indent}${edit}`);
+      // The edit must actually have landed, or the case would prove nothing.
+      expect(slicesSrc).toContain(anchor);
+      expect(body).toContain(unedited ? RETURN_LINE : edit);
+      if (!unedited) expect(body).not.toBe(slicesSrc);
       fs.writeFileSync(path.join(dir, name), body);
       files.push({ name, label, mustCompile });
     };
-    ALLOWED.forEach(([label, edit], i) => {
-      write(label, edit, true, i);
+    ALLOWED.forEach(([label, anchor, edit], i) => {
+      write(label, anchor, edit, true, i);
     });
-    BYPASS.forEach(([label, edit], i) => {
-      write(label, edit, false, i);
+    BYPASS.forEach(([label, anchor, edit], i) => {
+      write(label, anchor, edit, false, i);
     });
 
     const tsc = path.join(REPO, "node_modules/typescript/bin/tsc");

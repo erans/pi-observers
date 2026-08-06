@@ -22,10 +22,11 @@ import type { SliceName, SliceState, ToolCallRecord } from "./types.ts";
  *   3. BRANDED `Sanitized` TYPE. Only the two sanitizers turn a raw string into a
  *      Sanitized value; every assembly helper accepts Sanitized only, and the function
  *      that builds the document returns Sanitized, so the assembly region is closed at
- *      both ends. A new SliceState field that forgets to sanitize does not type-check,
- *      and neither does concatenating a raw string onto the document. The exported
- *      wrapper returns `string` and is the one line outside that region; it performs no
- *      assembly, only a call and a single named unbrand.
+ *      both ends against values typed `string`. A new SliceState field that forgets to
+ *      sanitize does not type-check, and neither does concatenating a `string` onto
+ *      the document. It does NOT stop a value typed `any`, and the exported wrapper
+ *      returns `string` and is the one line outside the region; both holes are
+ *      spelled out on the Sanitized type and on renderSlices rather than papered over.
  */
 
 /* ------------------------------------------------------------------ *
@@ -38,13 +39,30 @@ declare const SanitizedBrand: unique symbol;
  * A string that has passed through sanitizeSingleLine or sanitizeMultiLine, or that
  * was composed from such strings plus literal text written in this file.
  *
- * What this actually buys, stated precisely: `Sanitized` is produced only by the two
+ * WHAT THIS GUARANTEES, and against what. `Sanitized` is produced only by the two
  * sanitizers and by the `s` template tag, whose interpolations are themselves
  * Sanitized. Every helper that assembles output takes Sanitized parameters, and
- * renderDocument returns Sanitized, so within that region a raw string can neither
- * enter nor leave without a compile error -- no cast is available to launder one.
- * `unbrand` and the exported renderSlices wrapper sit deliberately outside the region,
- * because the exported signature returns `string`; see the note on renderSlices.
+ * renderDocument returns Sanitized. Within that region a value typed `string` can
+ * neither enter nor leave without a compile error, and no cast is available to
+ * launder one.
+ *
+ * WHAT IT DOES NOT GUARANTEE. The brand is enforced against `string`. It is NOT
+ * enforced against `any`, which is assignable to every type by definition. Any value
+ * that reaches this module typed `any` -- from `JSON.parse`, from an untyped helper,
+ * from a third-party return, from an implicit-any parameter -- lands in a branded
+ * position with no diagnostic and emits its contents verbatim at runtime. Measured,
+ * not hypothesised: `document([...sections, JSON.parse(JSON.stringify(raw))])`
+ * compiles cleanly under this project's tsc settings and is not flagged by biome,
+ * which only objects to an explicit `any` annotation. This is inherent to
+ * TypeScript's type system and is not closable here.
+ *
+ * The practical consequence for a reader: treat `any` as the boundary. Anything
+ * arriving as `any` must be narrowed to `string` before it goes near this file, at
+ * which point the brand takes over and does hold.
+ *
+ * `unbrand` and the exported renderSlices wrapper also sit deliberately outside the
+ * region, because the exported signature returns `string`; see the note on
+ * renderSlices.
  */
 export type Sanitized = string & { readonly [SanitizedBrand]: true };
 
@@ -82,11 +100,16 @@ function joinLines(parts: Sanitized[]): Sanitized {
  *
  * This exists because `Array.prototype.join` is an untyped boundary: it returns
  * `string` for any element type, and an array literal mixing Sanitized with a raw
- * string widens silently to `(Sanitized | string)[]`. While the assembly ended in a
- * bare `[...].join("\n\n")`, seven cast-free single-line edits compiled cleanly and
- * emitted attacker-controlled text -- one of them ABOVE the preamble. Routing the
- * join through a `Sanitized[]` parameter closes that: a raw string in the array is a
- * compile error at the call site, not a silent widening.
+ * string infers `string[]` -- not `(Sanitized | string)[]` -- because `string` is the
+ * best common supertype, so the brand is erased silently rather than preserved in a
+ * union. While the assembly ended in a bare `[...].join("\n\n")`, six of the seven
+ * cast-free single-line edits later put to it compiled cleanly and emitted
+ * attacker-controlled text, one of them ABOVE the preamble; the seventh,
+ * `sections.push(raw)`, was already rejected TS2345 because `contents.map(...)`
+ * inferred `Sanitized[]` even without an annotation. Both figures are measured
+ * against 7e376a0:src/slices.ts, not estimated. Routing the join through a
+ * `Sanitized[]` parameter closes the six: a raw string in the array is a compile
+ * error at the call site, not a silent widening.
  */
 function document(parts: Sanitized[]): Sanitized {
   const first = parts[0];
@@ -525,10 +548,34 @@ function renderDocument(sees: SliceName[], state: SliceState): Sanitized {
  * The single point at which the brand is dropped. Named so that it is greppable and
  * so that any future second exit from the Sanitized world is a visible addition
  * rather than an inferred widening.
+ *
+ * The parameter type is load-bearing and must stay `Sanitized`. Widening it to
+ * `string` compiles silently -- it is strictly more permissive, so nothing at the one
+ * call site objects -- and it would reopen the whole assembly to raw strings while
+ * looking like a harmless generalisation. The N1 compiler test drives that exact
+ * widening through tsc and requires it to be rejected.
  */
 function unbrand(value: Sanitized): string {
   return value;
 }
+
+/**
+ * Compile-time pin on the signature above, checked by `tsc --noEmit` on every run.
+ *
+ * A conditional that is `true` while `unbrand` requires Sanitized and `never` once it
+ * accepts a plain `string`: a widened `unbrand` is assignable to `(value: string) =>
+ * string` (parameters are contravariant), the branded one is not. Assigning `true` to
+ * `never` is the error. Without this, widening the parameter compiles silently --
+ * it is strictly more permissive, so the single call site raises no objection -- and
+ * the whole assembly reopens to raw strings while the diff reads as a tidy-up.
+ *
+ * DO NOT DELETE AS DEAD CODE. It is deliberately unreferenced; the annotation is the
+ * whole point, and removing it removes the check. The N1 compiler test drives the
+ * widening through tsc and requires this assignment to fail.
+ */
+// biome-ignore lint/correctness/noUnusedVariables: compile-time assertion; the annotation is the check
+const UNBRAND_REQUIRES_SANITIZED: typeof unbrand extends (value: string) => string ? never : true =
+  true;
 
 /**
  * Render the requested slices as marker-delimited sections, in the order the observer
@@ -539,14 +586,22 @@ function unbrand(value: Sanitized): string {
  *   Enforced by the type system. `Sanitized` is produced only by sanitizeSingleLine
  *   and sanitizeMultiLine. Every assembly helper -- the `s` template tag, joinLines,
  *   document -- accepts Sanitized only, and renderDocument RETURNS Sanitized, so the
- *   assembly is closed: no raw string can enter it and no raw string can leave it.
- *   Adding a SliceState field and forgetting to sanitize it fails to compile, and so
- *   do all fourteen of the concatenation edits in the type-bypass test.
+ *   assembly is closed against `string`: no value typed `string` can enter it and
+ *   none can leave it. Adding a SliceState field and forgetting to sanitize it fails
+ *   to compile, and so do all fifteen of the edits in the type-bypass test.
  *
- *   NOT enforced by the type system, stated plainly. `unbrand` and the one-line body
- *   of renderSlices below are outside the closed region by definition: the exported
- *   signature returns `string`, so any edit that concatenates onto the RESULT of
- *   renderSlices, or that returns something else entirely from renderSlices, compiles.
+ *   NOT enforced by the type system, stated plainly. Two holes, both known, both
+ *   measured, neither closable here.
+ *
+ *   First, `any`. The brand stops `string`, not `any`, which is assignable to
+ *   everything. A value arriving as `any` -- JSON.parse, an untyped helper, a
+ *   third-party return -- reaches a branded position with no diagnostic. See the note
+ *   on the Sanitized type.
+ *
+ *   Second, the exit. `unbrand` and the one-line body of renderSlices below are
+ *   outside the closed region by definition: the exported signature returns `string`,
+ *   so any edit that concatenates onto the RESULT of renderSlices, or that returns
+ *   something else entirely from renderSlices, compiles.
  *   That is why renderSlices contains no assembly of its own -- a single call and a
  *   single unbrand -- and why all seven attacker-reachable fields are consumed inside
  *   renderDocument, where the types do hold.
