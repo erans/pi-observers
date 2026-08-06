@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -222,5 +222,99 @@ describe("formatObserverStatus — exploratory", () => {
     expect(out).not.toMatch(/\b1 runs\b/);
     expect(out).toMatch(/\b1 failure\b/);
     expect(out).not.toMatch(/\b1 failures\b/);
+  });
+});
+
+describe("readGoal — path exists but is unreadable", () => {
+  it("returns undefined without throwing when a directory sits at the goal path", () => {
+    // Exercises the try/catch directly, bypassing writeGoal entirely: existsSync sees
+    // something at the path, then readFileSync throws (EISDIR) reading it as a file.
+    // The goal-tracking observer's veto must fail open here, never throw and wedge a turn.
+    mkdirSync(goalFilePath(cwd), { recursive: true });
+    expect(() => readGoal(cwd)).not.toThrow();
+    expect(readGoal(cwd)).toBeUndefined();
+  });
+});
+
+describe("writeGoal — ordinary overwrite does not delete first", () => {
+  it("keeps the same inode across two writes to an existing goal file", () => {
+    // The pre-emptive rmSync+recreate strategy is only for the directory-recovery path.
+    // An ordinary overwrite of an existing goal file must truncate-and-rewrite in place
+    // (same inode), not unlink-then-recreate (new inode) -- the latter loses atomicity:
+    // a crash between the unlink and the write would lose an existing goal outright.
+    writeGoal(cwd, "First");
+    const inoBefore = statSync(goalFilePath(cwd)).ino;
+    writeGoal(cwd, "Second, and longer than the first");
+    const inoAfter = statSync(goalFilePath(cwd)).ino;
+    expect(inoAfter).toBe(inoBefore);
+    expect(readGoal(cwd)).toBe("Second, and longer than the first");
+  });
+});
+
+describe("formatObserverStatus — failure gating", () => {
+  it("does not report zero failures for a healthy, non-disabled observer", () => {
+    const out = formatObserverStatus([
+      { name: "healthy", enabled: true, model: "m", runs: 5, failures: 0, disabled: false, accepted: 2, dropped: 0 },
+    ]);
+    expect(out).not.toMatch(/0 failures?/);
+  });
+
+  it("does not double-report a disabled observer's failure count", () => {
+    // The count already appears once in the state label ("disabled after 3 failures");
+    // it must not also appear a second time in the trailing parts list.
+    const out = formatObserverStatus([
+      { name: "flaky", enabled: true, model: "m", runs: 3, failures: 3, disabled: true, accepted: 0, dropped: 0 },
+    ]);
+    const occurrences = out.match(/3 failures?/g) ?? [];
+    expect(occurrences).toHaveLength(1);
+  });
+});
+
+describe("formatObserverStatus — row forgery via name/model", () => {
+  // Observer `name` and `model` are copied out of the `name:`/`model:` frontmatter
+  // fields of `.pi/observers/*.md` with nothing more than a `.trim()`
+  // (src/definitions.ts). Those files are project-scoped repo content, which this
+  // project already treats as attacker-influenceable (see src/slices.ts). Every
+  // codepoint some renderer could treat as a line break must therefore be collapsed,
+  // or a malicious name could inject an extra apparent row -- or forge one outright.
+  const SEPARATORS: Record<string, string> = {
+    CR: "\r",
+    LF: "\n",
+    CRLF: "\r\n",
+    NEL: "\u0085",
+    VT: "\u000B",
+    FF: "\u000C",
+    LS: "\u2028",
+    PS: "\u2029",
+  };
+
+  for (const [label, sep] of Object.entries(SEPARATORS)) {
+    it(`collapses a ${label} inside a name so N rows always produce N lines`, () => {
+      const forgedName = `evil${sep}forged-row [disabled after 99 failures] fake-model`;
+      const out = formatObserverStatus([
+        { name: forgedName, enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+        { name: "second-observer", enabled: false, model: "-", runs: 0, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      ]);
+      expect(out.split("\n")).toHaveLength(2);
+      // `.split("\n")` alone only catches LF/CRLF — a raw CR, NEL, VT, FF, LS, or PS
+      // left in the output doesn't change that count, but a terminal or markdown
+      // renderer can still treat it as a break. Assert the raw separator is gone
+      // too, not just that counting by "\n" happens to still work out. Skip this
+      // for bare LF: a single "\n" legitimately remains in the output as the
+      // between-rows join, so its mere presence there is not a leak of the
+      // separator that was inside the name.
+      if (label !== "LF") {
+        expect(out).not.toContain(sep);
+      }
+    });
+  }
+
+  it("caps an extremely long name so one row cannot dominate the output", () => {
+    const out = formatObserverStatus([
+      { name: "x".repeat(10_000), enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+    ]);
+    const lines = out.split("\n");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.length).toBeLessThan(300);
   });
 });
