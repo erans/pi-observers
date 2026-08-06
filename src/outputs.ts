@@ -5,6 +5,14 @@ import type { ObserverDefinition, Proposal } from "./types.ts";
 export interface ProposalCollector {
   /** The single proposal from this run, or null if the observer stayed quiet. */
   take(): Proposal | null;
+  /**
+   * Clear the proposal and warnings so the same tool objects can serve the next
+   * run. The runner creates its tools once, at session creation, and the model
+   * only ever sees those objects; rebuilding them per run would leave the model
+   * writing into a collector nobody reads. Resetting is how a run starts clean
+   * without replacing the tools.
+   */
+  reset(): void;
   warnings: string[];
 }
 
@@ -121,6 +129,10 @@ export function createOutputTools(def: ObserverDefinition) {
 
   const collector: ProposalCollector = {
     take: () => proposal,
+    reset: () => {
+      proposal = null;
+      warnings.length = 0;
+    },
     warnings,
   };
 
