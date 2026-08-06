@@ -78,13 +78,20 @@ export function writeMemoryNote(opts: { cwd: string; text: string; type?: string
   const type = NOTE_TYPES.includes(opts.type as (typeof NOTE_TYPES)[number])
     ? (opts.type as string)
     : DEFAULT_NOTE_TYPE;
-  // description is arbitrary user text and MUST be quoted. Unquoted, a colon makes the
-  // frontmatter fail to parse, a leading "-" turns it into a sequence, and a leading "#"
-  // makes the whole value parse as null — silently discarding the description with no
-  // error anywhere. JSON.stringify emits a double-quoted scalar that YAML accepts, with
-  // quotes and backslashes escaped, and it is fully deterministic.
+  // name and description are both derived from arbitrary user text and MUST be quoted.
+  // Unquoted, a colon makes the frontmatter fail to parse, a leading "-" turns it into a
+  // sequence, and a leading "#" makes the whole value parse as null — silently discarding
+  // the value with no error anywhere. Even when none of that applies, an unquoted scalar
+  // that happens to be a YAML core-schema keyword parses as the wrong TYPE rather than as
+  // a string: a slug of "true"/"false" parses as a boolean, "null" as null, and a
+  // slug that is all digits (e.g. "42") as a number — all reachable through deriveSlug
+  // from ordinary note text ("True", "Null", "42"). JSON.stringify emits a double-quoted
+  // scalar that YAML accepts, with quotes and backslashes escaped, and it is fully
+  // deterministic. `type` is exempt: it is validated above against a fixed vocabulary of
+  // four lowercase words, none of which collides with a YAML keyword or parses as a
+  // number, so it cannot reach either failure mode.
   const content = `---
-name: ${slug}
+name: ${JSON.stringify(slug)}
 description: ${JSON.stringify(deriveDescription(text))}
 type: ${type}
 ---

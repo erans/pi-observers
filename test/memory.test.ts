@@ -43,7 +43,7 @@ describe("writeMemoryNote", () => {
     const { path, slug } = writeMemoryNote({ cwd, text: "The build uses Vite not Webpack" });
     expect(slug).toBe("the-build-uses-vite-not-webpack");
     const content = readFileSync(path, "utf8");
-    expect(content).toContain("name: the-build-uses-vite-not-webpack");
+    expect(content).toContain('name: "the-build-uses-vite-not-webpack"');
     expect(content).toContain("type: project");
     expect(content).toContain("The build uses Vite not Webpack");
   });
@@ -79,6 +79,26 @@ describe("writeMemoryNote", () => {
       const fm = parse(raw.split("---")[1] as string);
       expect(typeof fm.description).toBe("string");
       expect(fm.description.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("writes a name that parses as a string even when the slug is a YAML core-schema keyword", () => {
+    // Unquoted, these slugs don't fail to parse — they parse as the WRONG TYPE: "true"/
+    // "false" become booleans, "null" becomes null, and an all-digit slug becomes a
+    // number. Asserting typeof (not just the value) is essential: a bare
+    // `expect(fm.name).toBe("true")` passes whether fm.name is the string "true" or the
+    // boolean true, since `toBe` on those isn't what distinguishes them from a bug here —
+    // only an explicit typeof check does.
+    // "Yes"/"No" are included per the brief's list but are not actually reachable as a
+    // type-confusion here: this project's `yaml` (v2, core schema per YAML 1.2) parses
+    // "yes"/"no" as plain strings, not booleans (that's YAML 1.1 behaviour). They're kept
+    // as regression coverage in case the schema ever changes.
+    for (const text of ["True", "False", "Null", "42", "1e10", "Yes", "No"]) {
+      const { path, slug } = writeMemoryNote({ cwd, text });
+      const raw = readFileSync(path, "utf8");
+      const fm = parse(raw.split("---")[1] as string);
+      expect(typeof fm.name).toBe("string");
+      expect(fm.name).toBe(slug);
     }
   });
 
