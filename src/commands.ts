@@ -115,12 +115,25 @@ const ROW_LINE_SEPARATORS = /[\r\n\u0085\u000B\u000C\u2028\u2029]+/g;
  */
 const MAX_ROW_FIELD_LENGTH = 200;
 
+/**
+ * Truncate to `maxCodePoints` code points, never splitting a surrogate pair. A plain
+ * `value.slice(0, n)` counts UTF-16 units, not code points, so a name whose cap
+ * happens to land inside an astral character (emoji, etc.) would emit a lone
+ * high surrogate — the same bug class Task 5 fixed for `src/slices.ts`'s per-field
+ * caps; this project should not disagree with itself about whether that matters.
+ */
+function truncateCodePoints(value: string, maxCodePoints: number): string {
+  const points = Array.from(value);
+  return points.length <= maxCodePoints ? value : points.slice(0, maxCodePoints).join("");
+}
+
 /** Collapse line-break codepoints to a space and cap length, so one row is always
  *  exactly one rendered line regardless of what a repo-resident observer file names
  *  itself. */
 function sanitizeRowField(value: string): string {
   const collapsed = value.replace(ROW_LINE_SEPARATORS, " ");
-  return collapsed.length > MAX_ROW_FIELD_LENGTH ? `${collapsed.slice(0, MAX_ROW_FIELD_LENGTH)}...` : collapsed;
+  const truncated = truncateCodePoints(collapsed, MAX_ROW_FIELD_LENGTH);
+  return truncated.length < collapsed.length ? `${truncated}...` : collapsed;
 }
 
 export function formatObserverStatus(rows: StatusRow[]): string {

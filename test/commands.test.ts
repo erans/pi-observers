@@ -318,3 +318,57 @@ describe("formatObserverStatus — row forgery via name/model", () => {
     expect(lines[0]!.length).toBeLessThan(300);
   });
 });
+
+describe("formatObserverStatus — row forgery via model (R2-1)", () => {
+  // R2-1: removing sanitizeRowField() from row.model alone must fail a test.
+  // The name-only tests above don't exercise this at all -- model is a
+  // separate call site in the implementation and needs its own coverage.
+  it("collapses a NEL inside a model so N rows always produce N lines", () => {
+    const forgedModel = "evil" + "\u0085" + "forged-row [disabled after 99 failures] fake-name";
+    const out = formatObserverStatus([
+      { name: "n1", enabled: true, model: forgedModel, runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      { name: "n2", enabled: false, model: "-", runs: 0, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+    ]);
+    expect(out.split("\n")).toHaveLength(2);
+    expect(out).not.toContain("\u0085");
+  });
+
+  it("caps an extremely long model so one row cannot dominate the output", () => {
+    const out = formatObserverStatus([
+      { name: "n", enabled: true, model: "x".repeat(10_000), runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+    ]);
+    const lines = out.split("\n");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.length).toBeLessThan(300);
+  });
+});
+
+describe("formatObserverStatus — truncation is code-point safe (R2-2)", () => {
+  // Mirrors test/slices.test.ts's surrogate-safety pattern: an astral character
+  // (U+1F600 GRINNING FACE), written as its surrogate pair in escapes only, is never
+  // typed as a literal character in this source file.
+  const EMOJI = "\uD83D\uDE00";
+  const LONE_HIGH_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/;
+  const LONE_LOW_SURROGATE = /(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  const CAP = 200; // MAX_ROW_FIELD_LENGTH in src/commands.ts -- kept in sync by this test
+
+  it.each([CAP - 1, CAP, CAP + 1, CAP + 50])(
+    "never splits a surrogate pair when the name lands the emoji at/around the cap (pad=%i)",
+    (pad) => {
+      const name = "z".repeat(pad) + EMOJI;
+      const out = formatObserverStatus([
+        { name, enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      ]);
+      expect(LONE_HIGH_SURROGATE.test(out)).toBe(false);
+      expect(LONE_LOW_SURROGATE.test(out)).toBe(false);
+    },
+  );
+
+  it("keeps a whole trailing emoji that fits exactly at the cap, rather than splitting it", () => {
+    const name = "z".repeat(CAP - 1) + EMOJI;
+    const out = formatObserverStatus([
+      { name, enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+    ]);
+    expect(out).toContain(EMOJI);
+  });
+});
