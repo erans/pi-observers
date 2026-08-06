@@ -3,6 +3,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   SessionManager,
+  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { ModelLike } from "./models.ts";
 import { createOutputTools } from "./outputs.ts";
@@ -99,9 +100,36 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
   // likewise suppresses discovery of an append-prompt file (pi only discovers when
   // the option is absent, and an empty array is present); omitting it would let a
   // project's append file leak into every observer.
+  // Hermetic on settings too, not just resources. Leaving this unset defaults BOTH
+  // DefaultResourceLoader and createAgentSession to `SettingsManager.create(cwd, agentDir)`,
+  // which reads the user's real global settings.json AND, per `fromStorage`'s
+  // `projectTrusted ?? true`, treats the checked-out repo's project settings as
+  // TRUSTED with no trust prompt — widening the same repo-resident-content attack
+  // surface `src/slices.ts` exists to sanitize. Concretely, an inherited settings
+  // manager would let the host's (or a hostile repo's) settings silently reach every
+  // observer session:
+  //   - compaction: observer sessions are long-lived by design (context accumulates
+  //     across wakes, see below) — a user who disabled auto-compaction would get an
+  //     observer whose context grows every turn until the provider rejects the
+  //     request, and the bus disables it after 3 silent failures with nothing
+  //     pointing at the real cause. Set explicitly here rather than left to inherit.
+  //   - retry/timeout settings: a transient provider blip under the host's retry
+  //     policy could burn straight through the bus's 3-strike disable budget.
+  //   - thinkingBudgets: redefines what `def.thinking` (e.g. "low") actually costs,
+  //     so the same observer definition behaves differently for different users.
+  // `inMemory` reads no settings file at all, which closes all of the above at once;
+  // `projectTrusted: false` is set anyway (redundant today, since inMemory has no
+  // project file to trust) as defence against a future change to the storage
+  // backend, and to state the intent at the call site.
+  const settingsManager = SettingsManager.inMemory(
+    { compaction: { enabled: true } },
+    { projectTrusted: false },
+  );
+
   const resourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
+    settingsManager,
     noExtensions: true,
     noSkills: true,
     noPromptTemplates: true,
@@ -128,6 +156,7 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
     model: model as never,
     thinkingLevel: def.thinking,
     sessionManager: SessionManager.inMemory(cwd),
+    settingsManager,
     resourceLoader,
     tools: def.tools,
     customTools: tools,

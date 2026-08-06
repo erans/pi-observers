@@ -356,6 +356,27 @@ describe("createObserverRunner (exploratory)", () => {
     expect(opts.sessionManager.isPersisted()).toBe(false);
   });
 
+  it("gives the session a hermetic, explicitly-configured settings manager", async () => {
+    // Defect guard: an unset settingsManager defaults to `SettingsManager.create(cwd,
+    // agentDir)` inside both DefaultResourceLoader and createAgentSession, which reads
+    // the user's real global settings.json AND trusts the checked-out repo's project
+    // settings by default (`projectTrusted ?? true`). That would let a host's disabled
+    // auto-compaction setting silently starve a persistent observer session until the
+    // provider rejects it, or let a hostile repo's project settings reach the session
+    // the same way `src/slices.ts` guards definition content against.
+    const h = harness();
+    await build(h);
+    const opts = h.options();
+    expect(opts.settingsManager).toBeDefined();
+    // Compaction must be explicitly on, not merely defaulted: an observer session
+    // accumulates context across every wake by design, so without compaction it grows
+    // unboundedly until the provider rejects the request and the bus disables it.
+    expect(opts.settingsManager.getCompactionEnabled()).toBe(true);
+    // Not the user's real project settings, regardless of what SettingsManager.inMemory
+    // happens to default to today.
+    expect(opts.settingsManager.isProjectTrusted()).toBe(false);
+  });
+
   it("names itself after the definition", async () => {
     const h = harness();
     expect((await build(h)).name).toBe("memory-recall");
