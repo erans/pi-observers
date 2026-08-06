@@ -1282,8 +1282,28 @@ describe("delivery", () => {
     expect(rendered).toContain("total=2000");
     expect(rendered).not.toContain(`total=${MAX_TURN_TOOL_CALLS}`);
 
-    // A /reload must not carry the old run's omissions into the new session's total,
-    // which would make the number wrong in the other direction.
+    // A SECOND AGENT RUN must not inherit the first run's omissions. `turnToolCalls` is
+    // reset at this boundary; the omitted count is half of the same record and has to be
+    // reset with it, or a three-call run after a flooded one renders
+    // `shown=3 total=1503` and a run that makes NO calls renders `total=1500`. Same
+    // number, same line, wrong in the opposite direction.
+    await fire(h, "before_agent_start", {}, ctx);
+    for (const id of ["r1", "r2", "r3"]) {
+      await fire(h, "tool_execution_start", { toolCallId: id, toolName: "read", args: {} }, ctx);
+      await fire(
+        h,
+        "tool_execution_end",
+        { toolCallId: id, toolName: "read", isError: false },
+        ctx,
+      );
+    }
+    await tick();
+    expect(seen.at(-1)?.toolCallsOmitted).toBe(0);
+    const secondRun = renderSlices(["tool_calls_this_turn"], seen.at(-1) ?? {});
+    expect(secondRun).toContain("status=present");
+    expect(secondRun).not.toContain("total=");
+
+    // A /reload must not carry them either.
     await fire(h, "session_start", {}, ctx);
     await fire(h, "before_agent_start", {}, ctx);
     await fire(h, "tool_execution_start", { toolCallId: "n", toolName: "read", args: {} }, ctx);
@@ -2010,6 +2030,46 @@ describe("observer status notes", () => {
     // separator appears twice in the note (as the name, and quoted back inside the
     // reason) and must manufacture no additional apparent row from either.
     expect(out.split("\n").filter((l) => l.startsWith("evil"))).toHaveLength(2);
+  });
+
+  it("reports a definition that failed to load, in /observers and not only as a toast", async () => {
+    // Everything else in this view comes from `loaded`, and a definition that failed to
+    // load is by definition not in it -- so the surface a user consults when observers
+    // are missing was the only surface that could not say why. It was reported once, at
+    // session_start, as a toast gated on hasUI.
+    const s = await status({
+      discover: () => ({
+        observers: [],
+        errors: [
+          {
+            file: "/repo/.pi/observers",
+            message: "project observers were not loaded because this project is not trusted",
+          } as never,
+        ],
+      }),
+    });
+    const out = await s.read();
+    expect(out).toContain("not loaded: /repo/.pi/observers");
+    expect(out).toContain("not trusted");
+  });
+
+  it("sanitizes a load failure before rendering it", async () => {
+    // Both fields come off disk: a path from the filesystem and a message built from a
+    // parse failure in an attacker-influenceable file.
+    const s = await status({
+      discover: () => ({
+        observers: [],
+        errors: [
+          {
+            file: "/repo/.pi/observers/a.md",
+            message: "bad frontmatter\u2028forged: STOPPED after 99 consecutive failures",
+          } as never,
+        ],
+      }),
+    });
+    const out = await s.read();
+    expect(out).not.toContain("\u2028");
+    expect(out.split("\n").filter((l) => l.startsWith("forged"))).toHaveLength(0);
   });
 
   it("explains why an observer never loaded", async () => {

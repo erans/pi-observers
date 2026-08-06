@@ -156,19 +156,6 @@ same point again -- it is not silently recorded as delivered.
 
 `maxAdvisoriesPerTurn` and `vetoBudget` are both capped at 10 however high you set them.
 
-## Trust
-
-Observer definitions are loaded from three places: the bundled `observers/` directory,
-`<agent dir>/observers/`, and the project's own `.pi/observers/`. **The project layer is
-loaded only when the project is trusted.**
-
-A definition is not configuration that this extension renders -- it is an agent that
-runs, on your credentials, at a trigger the file chooses, reading whatever the process
-can read. Precedence keys on the `name` field, so an untrusted project file could
-otherwise replace a shipped observer outright rather than merely adding one. When the
-layer is skipped and `.pi/observers/` exists, `/observers` says so rather than reporting
-an empty install.
-
 `vetoBudget` is per observer **per fingerprint** -- the string the observer uses to
 identify the thing it is objecting to. It is not a bound on its own, because the
 fingerprint is chosen by the observer's model: vary it and you get a fresh budget. Two
@@ -184,6 +171,23 @@ They are derived rather than exposed because the only reason anyone raises a bac
 to get past it, and deriving them keeps the cap of 10 on `vetoBudget` hard-capping them
 too. Both survive a `/reload`. When one stops a veto, `/observers` shows it as a dropped
 proposal with the ceiling named in the reason.
+
+## Trust
+
+Observer definitions are loaded from three places: the bundled `observers/` directory,
+`<agent dir>/observers/`, and the project's own `.pi/observers/`. **The project layer is
+loaded only when the project is trusted.**
+
+A definition is not configuration that this extension renders -- it is an agent that
+runs, on your credentials, at a trigger the file chooses, reading whatever the process
+can read. Precedence keys on the `name` field, so an untrusted project file could
+otherwise replace a shipped observer outright rather than merely adding one.
+
+When the layer is skipped and `.pi/observers/` contains at least one `.md` file, you get
+a warning at session start and a `not loaded:` line in `/observers` naming the directory
+and the reason. An empty `.pi/observers/`, or one holding no definitions, says nothing --
+there is nothing that would have loaded. The same two surfaces report a definition that
+failed to parse, or a directory that could not be read.
 
 ## Design
 

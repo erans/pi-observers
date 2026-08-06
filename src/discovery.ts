@@ -21,9 +21,10 @@ export interface DiscoveryResult {
   errors: ObserverDefinitionError[];
 }
 
-function isDirectory(path: string): boolean {
+/** Whether a directory holds at least one file this module would try to parse. */
+function hasDefinitions(dir: string): boolean {
   try {
-    return statSync(path).isDirectory();
+    return readdirSync(dir).some((entry) => entry.endsWith(".md"));
   } catch {
     return false;
   }
@@ -98,10 +99,12 @@ export function discoverObservers(opts: DiscoveryOptions): DiscoveryResult {
   const projectDir = join(opts.cwd, CONFIG_DIR_NAME, "observers");
   if (opts.projectTrusted) {
     layers.push([projectDir, "project"]);
-  } else if (isDirectory(projectDir)) {
-    // Silence here would be the same defect as the unreadable-directory case above:
-    // definitions present, nothing loaded, no way to tell why. Routed through `errors`
-    // so the existing notify loop in src/index.ts surfaces it unchanged.
+  } else if (hasDefinitions(projectDir)) {
+    // Only when something would actually have loaded. Warning about an empty directory,
+    // or one holding nothing but a README, contradicts the reason this stays silent when
+    // the directory is absent: a warning about nothing teaches the user to ignore the
+    // warning that matters. Routed through `errors` so the surfaces in src/index.ts pick
+    // it up unchanged.
     errors.push(
       new ObserverDefinitionError(
         "project observers were not loaded because this project is not trusted; trust the project to enable them",

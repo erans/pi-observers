@@ -130,6 +130,28 @@ describe("discoverObservers", () => {
       expect(errors[0]?.file).toContain(join(".pi", "observers"));
     });
 
+    it("stays silent when the project's observers directory holds nothing loadable", () => {
+      // Same rationale as the absent-directory case below: a warning about nothing
+      // teaches the user to ignore the warning that matters. An empty directory, and one
+      // holding only a README, would both have loaded zero observers even if trusted.
+      const { errors: emptyDir } = discoverObservers({
+        cwd,
+        agentDir,
+        builtinDir,
+        projectTrusted: false,
+      });
+      expect(emptyDir).toEqual([]);
+
+      writeFileSync(join(cwd, ".pi", "observers", "README.txt"), "notes, not a definition");
+      const { errors: noMarkdown } = discoverObservers({
+        cwd,
+        agentDir,
+        builtinDir,
+        projectTrusted: false,
+      });
+      expect(noMarkdown).toEqual([]);
+    });
+
     it("stays silent when the project has no observers directory at all", () => {
       // The common case. A warning here would train the user to ignore the warning.
       const bare = mkdtempSync(join(tmpdir(), "pi-observers-bare-"));

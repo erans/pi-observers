@@ -477,9 +477,26 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   let bus = new ProposalBus();
   let loaded: Loaded[] = [];
   let turnToolCalls: ToolCallRecord[] = [];
-  /** Running count of tool calls discarded by compactToolCalls, for the in-band marker. */
+  /**
+   * Tool calls discarded by compactToolCalls in the current agent run.
+   *
+   * Half of one record with `turnToolCalls`, and reset in every place that one is:
+   * src/slices.ts adds the two together to produce the `total=` on its marker line, so a
+   * count that outlives its list inflates an authoritative number rather than
+   * understating it.
+   */
   let omittedToolCalls = 0;
   let goalDiagnosis: GoalDiagnosis = { state: "unset" };
+  /**
+   * Definition-load failures from the last session_start, kept for /observers.
+   *
+   * They were reported once, as a session_start toast gated on `hasUI`, and nowhere
+   * else. Everything /observers renders comes from `loaded`, and a definition that
+   * failed to load is by definition not in it -- so the surface a user consults when
+   * observers are missing was the one surface that could not mention the reason they
+   * are missing, including "this project is not trusted".
+   */
+  let discoveryErrors: Array<{ file: string; message: string }> = [];
 
   /** Arguments seen at tool_execution_start, keyed by toolCallId.
    *
@@ -541,6 +558,14 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
    */
   function observerNotes(): string[] {
     const notes: string[] = [];
+    // First, because these explain why an observer a user expects is ABSENT from every
+    // row below. Both fields come from disk -- a path and a parse or trust message -- so
+    // they get the same one-line sanitation as every other rendered field.
+    for (const error of discoveryErrors) {
+      notes.push(
+        `not loaded: ${oneLine(error.file, MAX_NOTE_CHARS)} - ${oneLine(error.message, MAX_NOTE_CHARS)}`,
+      );
+    }
     for (const entry of loaded) {
       const name = oneLine(entry.def.name, MAX_OBSERVER_NAME_CODE_POINTS);
       const status = bus.status(entry.def.name);
@@ -774,6 +799,9 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     omittedToolCalls = 0;
     pendingToolArgs.clear();
     tallies.clear();
+    // discoveryErrors is NOT reset here. It is replaced wholesale a few lines below, on
+    // the same unconditional path, so a reset would be a guard no test could fail --
+    // which this branch treats as a defect rather than as caution.
 
     // Dedupe and veto spend must both survive /reload and resume. Both are handed to
     // the reconciler, which owns the budget and validates what comes off disk.
@@ -821,6 +849,8 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       projectTrusted: ctx.isProjectTrusted(),
     });
 
+    // Replaces the previous session's list outright; see the note in the reset block.
+    discoveryErrors = errors.map((error) => ({ file: error.file, message: error.message }));
     for (const error of errors) {
       if (ctx.hasUI) ctx.ui.notify(`observer "${error.file}": ${error.message}`, "error");
     }
@@ -913,6 +943,14 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     // that provoked it), but it is not what "resets per agent run" would lead you to
     // expect, so it is stated rather than left to be rediscovered.
     turnToolCalls = [];
+    // Reset WITH the list, never separately. These two are one record: the entries and
+    // the count of entries that were dropped from it. Resetting the array alone made
+    // `total=` wrong in the opposite direction from the bug it was added to fix -- a run
+    // that made three tool calls, after an earlier run that flooded 2000, rendered
+    // `status=truncated shown=3 total=1503`, and a run that made none rendered
+    // `total=1500`. On the one line content cannot forge, telling the verification
+    // observer that 1500 tool calls happened in a run that made none.
+    omittedToolCalls = 0;
     pendingToolArgs.clear();
     kickAll("before_agent_start", ctx);
     const advisories = drainFor("next_prompt");
