@@ -4,7 +4,8 @@ File-defined observer agents for [pi](https://pi.dev). Observers watch one axis 
 quality each, propose at most a short advisory, and a reconciler decides what reaches
 the main agent. They are read-only and never answer on the agent's behalf.
 
-The pattern is inspired by the persistent background agents of Meta's Muse Code
+The pattern is inspired by the persistent background agents of
+[Meta's Muse Code](https://research.meta.ai/blog/introducing-muse-code-and-muse-spark-1-2)
 (Meta's own docs are login-gated and name no observer roster; the four bundled here
 are this project's design). They ship as worked examples -- plain files in the same
 format any observer uses.
