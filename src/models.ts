@@ -5,7 +5,16 @@ export interface ModelLike {
   id: string;
 }
 
-/** Narrow view of pi's ModelRegistry, so resolution is testable without pi. */
+/** Narrow view of pi's ModelRegistry, so resolution is testable without pi.
+ *
+ * Contracts:
+ * - `all()` must return results in stable order. When multiple entries
+ *   normalize to the same id, the deterministic winner is the first by
+ *   (provider, id) lexicographic sort — callers rely on this tie-break.
+ * - Authentication and availability filtering are the adapter's responsibility,
+ *   not this file's. Task 13's adapter must apply those before populating
+ *   the registry.
+ */
 export interface ModelLookup {
   find(provider: string, id: string): ModelLike | undefined;
   all(): ModelLike[];
@@ -20,10 +29,19 @@ export type ModelResolution =
 /**
  * Cosmetic id variations must not silently drop an observer to a different model:
  * `.` and `-` are equivalent in version numbers, and a trailing -YYYYMMDD date
- * stamp is optional.
+ * stamp is optional. The date suffix is stripped only when it is a plausible date
+ * (YYYY from 2000-2999, MM from 01-12, DD from 01-31) to avoid silently truncating
+ * legitimate model ids that happen to end in 8 digits.
  */
 export function normalizeModelId(id: string): string {
-  return id.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
+  const lower = id.toLowerCase().replace(/\./g, "-");
+  // Only strip a suffix if it parses as a valid date: YYYYMMDD where
+  // YYYY is 2000-2999, MM is 01-12, DD is 01-31
+  const dateMatch = lower.match(/-(?:20|21|22|23|24|25|26|27|28|29)(\d{2})(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$/);
+  if (dateMatch) {
+    return lower.slice(0, -(dateMatch[0].length));
+  }
+  return lower;
 }
 
 function splitRef(ref: string): { provider?: string; id: string } {
@@ -42,12 +60,24 @@ function resolveRef(ref: string, lookup: ModelLookup): { model: ModelLike; via: 
     if (exact) return { model: exact, via: "exact" };
 
     const target = normalizeModelId(id);
-    const fuzzy = lookup.all().find((m) => m.provider === provider && normalizeModelId(m.id) === target);
+    // Sort by (provider, id) to break ties deterministically when multiple
+    // entries normalize to the same id
+    const candidates = lookup
+      .all()
+      .filter((m) => m.provider === provider && normalizeModelId(m.id) === target)
+      .sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+    const fuzzy = candidates[0];
     if (fuzzy) return { model: fuzzy, via: "fuzzy" };
   }
 
   const target = normalizeModelId(id);
-  const anyProvider = lookup.all().find((m) => normalizeModelId(m.id) === target);
+  // Sort by (provider, id) to break ties deterministically when multiple
+  // entries normalize to the same id
+  const candidates = lookup
+    .all()
+    .filter((m) => normalizeModelId(m.id) === target)
+    .sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+  const anyProvider = candidates[0];
   if (anyProvider) return { model: anyProvider, via: "any-provider" };
 
   return undefined;
@@ -63,7 +93,8 @@ export function resolveObserverModel(
   lookup: ModelLookup,
   opts: { defaultModel?: string; sessionModel?: ModelLike },
 ): ModelResolution {
-  const primary = def.model ?? opts.defaultModel;
+  // Treat blank or whitespace-only model as absent, before falling through to defaultModel
+  const primary = (def.model?.trim() || undefined) ?? opts.defaultModel;
   const attempted: string[] = [];
 
   if (primary) {
