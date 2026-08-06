@@ -68,8 +68,15 @@ Two triggers drain a delivery point in the same handler that starts the run:
 So pick a trigger *earlier* than your delivery point. `on: turn_end` with
 `deliver: settle` is the reliable pairing for anything judging finished work: an agent
 run doing real work has several turns before it settles, which is the room the observer
-needs to finish. A `can: [veto]` observer must never trigger on its own delivery point
--- a late veto reopens the turn after the one whose work it judged.
+needs to finish.
+
+A `can: [veto]` observer must never trigger on its own delivery point -- a late veto
+reopens the turn after the one whose work it judged. For a veto, "its own delivery
+point" is **always `settle`**, whatever `deliver:` says: holding the turn open is only
+meaningful there, so every veto is routed to `settle` and the `deliver:` field is
+ignored for it. Setting `deliver: next_prompt` on a `can: [veto]` observer does not move
+its veto and does not make `on: agent_settled` safe. Read the row above as
+`agent_settled` drains every veto, full stop.
 
 `tool_calls_this_turn` accumulates over a whole agent run (your request through the
 agent's final answer), not one model round-trip, so an observer reading it at
@@ -107,6 +114,14 @@ on every request to catch the minority that need a skill. If you want that trade
 change is a bounded await in the `before_agent_start` handler; nothing in the observer
 format needs to change.
 
+#### Known limitation: a `next_prompt` advisory needs a next prompt
+
+The same mechanism, one delivery point over. `verification` triggers at `agent_settled`
+and delivers at `next_prompt`, which is drained at `before_agent_start` -- so if you
+close the session, or never send another request, its advice about the run that just
+finished is never shown. Nothing is lost from an earlier run: unshown advisories are
+held and delivered at your next request, bounded to the most recent 100.
+
 ## Commands
 
 | Command | Effect |
@@ -127,6 +142,24 @@ format needs to change.
         "disable": ["verification"]
       }
     }
+
+`maxAdvisoriesPerTurn` and `vetoBudget` are both capped at 10 however high you set them.
+
+`vetoBudget` is per observer **per fingerprint** -- the string the observer uses to
+identify the thing it is objecting to. It is not a bound on its own, because the
+fingerprint is chosen by the observer's model: vary it and you get a fresh budget. Two
+ceilings derived from `vetoBudget` are the actual bound, and neither is separately
+configurable:
+
+| Ceiling | Value | Default | Max |
+|---|---|---|---|
+| Per observer, any fingerprint | `vetoBudget * 2` | 6 | 20 |
+| Session-wide, all observers | `vetoBudget * 4` | 12 | 40 |
+
+They are derived rather than exposed because the only reason anyone raises a backstop is
+to get past it, and deriving them keeps the cap of 10 on `vetoBudget` hard-capping them
+too. Both survive a `/reload`. When one stops a veto, `/observers` shows it as a dropped
+proposal with the ceiling named in the reason.
 
 ## Design
 

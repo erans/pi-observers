@@ -464,6 +464,17 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   const pendingToolArgs = new Map<string, string>();
 
   const held: Proposal[] = [];
+  /**
+   * Advisories drained at a settle that a veto pre-empted, waiting for the next settle.
+   *
+   * NOT `held`. A held proposal goes back through reconciler.reconcile() on the next
+   * drain, and these have already been through it: their fingerprints are in the
+   * accepted set and their entries are already appended, so re-holding them means the
+   * next drain discards them as "already delivered earlier in this session". The fix
+   * that looks obvious is a no-op, which is why this list is separate and why a test
+   * asserts delivery at the NEXT settle rather than merely asserting they were kept.
+   */
+  const deferredSettleAdvisories: Proposal[] = [];
   let pendingVeto: Proposal | null = null;
 
   /** Per-observer accepted/dropped counts for the /observers command. */
@@ -532,6 +543,16 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   function requeue(proposal: Proposal): void {
     held.push(proposal);
     if (held.length > MAX_HELD_PROPOSALS) held.shift();
+  }
+
+  /** Same bound as `held`: a deferral must not become an unbounded accumulation path. */
+  function deferSettleAdvisories(advisories: Proposal[]): void {
+    for (const advisory of advisories) {
+      deferredSettleAdvisories.push(advisory);
+      if (deferredSettleAdvisories.length > MAX_HELD_PROPOSALS) {
+        deferredSettleAdvisories.shift();
+      }
+    }
   }
 
   const activeFor = (trigger: TriggerEvent) =>
@@ -632,6 +653,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     });
     bus = new ProposalBus();
     held.length = 0;
+    deferredSettleAdvisories.length = 0;
     pendingVeto = null;
     turnToolCalls = [];
     pendingToolArgs.clear();
@@ -653,7 +675,9 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
         // Entries without an observer are from a pre-release entry format and are
         // skipped rather than guessed at: a wrong observer would spend, or refill,
         // the wrong ceiling.
-        const key = `${e.data.observer}\u0000${String(fingerprint)}`;
+        // Reconciler.vetoKey, not a second copy of its format. The two drifting apart
+        // is how a replay silently stops matching what it is meant to restore.
+        const key = Reconciler.vetoKey(String(e.data.observer), String(fingerprint));
         const seenSoFar = vetoSpend.get(key);
         vetoSpend.set(key, {
           observer: e.data.observer,
@@ -803,11 +827,17 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
 
   pi.on("agent_settled", async (_event, ctx) => {
     kickAll("agent_settled", ctx);
-    const advisories = drainFor("settle");
+    const drained = drainFor("settle");
 
     if (pendingVeto) {
       const veto = pendingVeto;
       pendingVeto = null;
+      // A veto and an advisory can be drained together, and this branch used to return
+      // with `drained` still in scope and nothing holding it -- spliced out of both
+      // `held` and the bus, not re-queued, not logged. Silent destruction of this
+      // extension's primary output, on the one turn the agent is being sent back to
+      // redo work and the advice is most useful. Defer instead.
+      deferSettleAdvisories(drained);
       pi.sendMessage(
         {
           customType: "observer-veto",
@@ -819,6 +849,10 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       return;
     }
 
+    const advisories = [
+      ...deferredSettleAdvisories.splice(0, deferredSettleAdvisories.length),
+      ...drained,
+    ];
     if (advisories.length > 0) {
       pi.sendMessage(
         { customType: "observer-advisory", content: formatAdvisories(advisories), display: true },

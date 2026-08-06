@@ -65,6 +65,27 @@ export interface VetoSpendEntry {
 const VETO_CEILING_MULTIPLIER = 2;
 
 /**
+ * Multiplier turning `vetoBudget` into a SESSION-WIDE ceiling on accepted vetoes,
+ * across every observer.
+ *
+ * The per-observer ceiling above bounds one observer. It does not bound the number of
+ * observers, and nothing else does either: `src/discovery.ts` loads every
+ * `.pi/observers/*.md` in the project. Measured: 1, 5, and 50 veto-capable observers
+ * yield 6, 30, and 300 accepted vetoes -- 300 turn reopenings, each a full agent
+ * round-trip. Per-observer fairness is the wrong axis for a runaway; what the user
+ * experiences is the total.
+ *
+ * Derived from `vetoBudget` rather than exposed as its own setting so that
+ * `src/settings.ts`'s cap of 10 on `vetoBudget` hard-caps this at 40 as well. A
+ * free-standing setting would lose that property, and the only reason anyone raises a
+ * backstop is to get past it.
+ *
+ * Strictly greater than VETO_CEILING_MULTIPLIER, so a single observer always hits its
+ * own ceiling first and the session ceiling never masks the more specific diagnosis.
+ */
+const VETO_SESSION_CEILING_MULTIPLIER = 4;
+
+/**
  * Decides which proposals reach the main agent.
  *
  * An observer proposes; this decides. Without a strict budget here the
@@ -81,17 +102,38 @@ export class Reconciler {
   /** Accepted vetoes per observer, whatever fingerprints were used. */
   readonly #vetoAccepted = new Map<string, number>();
   readonly #vetoCeiling: number;
+  /** Accepted vetoes this session across ALL observers. */
+  #vetoAcceptedTotal = 0;
+  readonly #vetoSessionCeiling: number;
 
   constructor(opts: ReconcilerOptions = {}) {
     this.#maxAdvisories = opts.maxAdvisoriesPerTurn ?? DEFAULTS.maxAdvisoriesPerTurn;
     this.#vetoBudget = opts.vetoBudget ?? DEFAULTS.vetoBudget;
     this.#vetoCeiling = this.#vetoBudget * VETO_CEILING_MULTIPLIER;
+    this.#vetoSessionCeiling = this.#vetoBudget * VETO_SESSION_CEILING_MULTIPLIER;
   }
 
-  /** Composite spend key. Built from two separately validated parts, never parsed
-   *  back apart, so an observer name containing the separator is harmless. */
+  /**
+   * Composite spend key, length-prefixed rather than delimiter-joined.
+   *
+   * A delimiter is only safe if it cannot appear in either part, and NEITHER part is
+   * under this module's control: `observer` is frontmatter from a repo-resident
+   * `.pi/observers/*.md`, and `fingerprint` comes straight off a model's tool call.
+   * With `:` the encoding was not injective -- observer "a" + fingerprint "b:c"
+   * produced the same key as observer "a:b" + fingerprint "c" -- and restore()'s
+   * `set()` overwrite turned that collision into a REFUND of an exhausted budget.
+   *
+   * Prefixing the observer's length makes the encoding injective for any content at
+   * all, including the separator itself, so there is no character either side has to
+   * avoid. `\u0000` (written as an escape, never as a literal) only has to be absent
+   * from a run of decimal digits, which it is by construction.
+   *
+   * src/index.ts builds the same composite for its replay map and calls THIS method
+   * rather than repeating the format; the two drifting apart is how a refund gets
+   * reintroduced without anything looking wrong at either site.
+   */
   static vetoKey(observer: string, fingerprint: string): string {
-    return `${observer}:${fingerprint}`;
+    return `${observer.length}\u0000${observer}${fingerprint}`;
   }
 
   /**
@@ -120,15 +162,31 @@ export class Reconciler {
 
     if (!vetoSpend) return;
     for (const entry of vetoSpend) {
-      if (this.#vetoSpend.size >= MAX_RESTORED_ENTRIES) break;
+      if (
+        this.#vetoSpend.size >= MAX_RESTORED_ENTRIES ||
+        this.#vetoAccepted.size >= MAX_RESTORED_ENTRIES
+      ) {
+        break;
+      }
       // BOTH parts are validated, not just the fingerprint. The key is what bounds this
       // map, so an unvalidated observer name reopens exactly the growth vector the
       // fingerprint check closes -- and `observer` is frontmatter from a repo-resident
       // definition, which is if anything the more attacker-controlled of the two.
+      //
+      // But they gate DIFFERENT things, and this is the whole point of the ordering
+      // below. An entry whose fingerprint is unusable used to be skipped entirely,
+      // which refunded the per-observer ceiling as well as the fingerprint budget --
+      // and since `fingerprint` is model-chosen with no length limit upstream, an
+      // observer could decide whether its own ceiling survived a reload just by
+      // emitting a 5000-character fingerprint. Measured before the fix: six replayed
+      // vetoes with over-long fingerprints bought six more accepted vetoes; with
+      // blank fingerprints, six more; with usable ones, zero.
+      //
+      // The ceiling exists precisely to be the part the model cannot influence, so it
+      // is credited on a valid `observer` ALONE. Fingerprint validity gates only the
+      // fingerprint-keyed budget.
       const observer = validKeyPart(entry?.observer);
-      const fingerprint = validKeyPart(entry?.fingerprint);
-      if (observer === undefined || fingerprint === undefined) continue;
-      const key = Reconciler.vetoKey(observer, fingerprint);
+      if (observer === undefined) continue;
       const count = entry.count;
       if (typeof count !== "number" || !Number.isInteger(count) || count <= 0) continue;
       // An implausible count is clamped, not rejected: at or above the budget means
@@ -143,18 +201,39 @@ export class Reconciler {
       // behaviourally equivalent to storing the value verbatim. No test pins it, and
       // none can.
       const spent = Math.min(count, this.#vetoBudget);
-      this.#vetoSpend.set(key, spent);
-      // The per-observer ceiling is replayed too, or a reload refills it and the
-      // runaway it exists to stop resumes with a clean slate.
+      // The ceilings are replayed first and unconditionally, or a reload refills them
+      // and the runaway they exist to stop resumes with a clean slate.
       this.#vetoAccepted.set(
         observer,
         Math.min((this.#vetoAccepted.get(observer) ?? 0) + spent, this.#vetoCeiling),
       );
+      this.#vetoAcceptedTotal = Math.min(this.#vetoAcceptedTotal + spent, this.#vetoSessionCeiling);
+
+      const fingerprint = validKeyPart(entry?.fingerprint);
+      if (fingerprint === undefined) continue;
+      this.#vetoSpend.set(Reconciler.vetoKey(observer, fingerprint), spent);
     }
   }
 
   accepted(): string[] {
     return [...this.#acceptedFingerprints];
+  }
+
+  /**
+   * Sizes of the three replay-bounded collections.
+   *
+   * Exposed because the caps in restore() are MEMORY bounds and reconcile() cannot
+   * observe them: once the veto ceilings are exhausted, a 1,000-entry replay and a
+   * 5,000-entry replay produce identical decisions forever after. Without this the cap
+   * is a guard no test can fail, which on this branch is treated as a defect rather
+   * than as coverage.
+   */
+  stateSize(): { fingerprints: number; vetoSpend: number; vetoObservers: number } {
+    return {
+      fingerprints: this.#acceptedFingerprints.size,
+      vetoSpend: this.#vetoSpend.size,
+      vetoObservers: this.#vetoAccepted.size,
+    };
   }
 
   reconcile(proposals: Proposal[]): ReconcileResult {
@@ -233,8 +312,20 @@ export class Reconciler {
         });
         continue;
       }
+      // Per-observer fairness is the wrong axis for a runaway. Nothing bounds the NUMBER
+      // of veto-capable observers a project can define, so a per-observer ceiling scales
+      // linearly with a count the project controls: 1, 5, and 50 observers measured at
+      // 6, 30, and 300 accepted vetoes. What the user experiences is the total.
+      if (this.#vetoAcceptedTotal >= this.#vetoSessionCeiling) {
+        dropped.push({
+          proposal: candidate,
+          reason: `session-wide ceiling of ${this.#vetoSessionCeiling} vetoes reached across all observers`,
+        });
+        continue;
+      }
       this.#vetoSpend.set(key, spent + 1);
       this.#vetoAccepted.set(candidate.observer, acceptedByObserver + 1);
+      this.#vetoAcceptedTotal += 1;
       veto = candidate;
     }
 

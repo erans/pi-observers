@@ -78,6 +78,36 @@ describe("bundled observers", () => {
     agent_settled: "settle",
   };
 
+  /**
+   * The rule as a value, so it can be tested against definitions that do NOT ship.
+   * The invariant test below applies it to the real files, which is what must hold; this
+   * is what makes the rule itself falsifiable, since nothing shipped violates it.
+   */
+  const selfDrains = (o: { on: string; deliver: string; can: string[] }): boolean => {
+    // What matters is where the proposal is ACTUALLY drained, not what `deliver:` says.
+    // src/index.ts routes every veto to `settle` regardless of the definition (a veto is
+    // only actionable while the turn can still be reopened), so an `on: agent_settled`
+    // veto-capable observer is self-draining whatever `deliver` claims.
+    const effectiveDeliver = o.can.includes("veto") ? "settle" : o.deliver;
+    return SELF_DRAINING_TRIGGERS[o.on] === effectiveDeliver;
+  };
+
+  it("recognises a self-draining configuration that does not ship", () => {
+    // src/definitions.ts accepts every shape below; none is hypothetical.
+    expect(selfDrains({ on: "agent_settled", deliver: "settle", can: ["veto"] })).toBe(true);
+    // The one the `deliver:`-only form waved through.
+    expect(selfDrains({ on: "agent_settled", deliver: "next_prompt", can: ["veto"] })).toBe(true);
+    expect(selfDrains({ on: "before_agent_start", deliver: "next_prompt", can: ["advise"] })).toBe(
+      true,
+    );
+    // ...and the configurations that are fine.
+    expect(selfDrains({ on: "turn_end", deliver: "settle", can: ["veto"] })).toBe(false);
+    expect(selfDrains({ on: "agent_settled", deliver: "next_prompt", can: ["advise"] })).toBe(
+      false,
+    );
+    expect(selfDrains({ on: "turn_end", deliver: "next_prompt", can: ["advise"] })).toBe(false);
+  });
+
   it("never lets a veto-capable observer trigger on its own delivery point", () => {
     // The rule, not the instance. A veto that arrives one occurrence late reopens the
     // turn AFTER the one whose work it judged, sending the agent back to redo work it
@@ -86,13 +116,7 @@ describe("bundled observers", () => {
     for (const o of load().observers) {
       if (!o.can.includes("veto")) continue;
       checked += 1;
-      // What matters is where the proposal is ACTUALLY drained, not what `deliver:`
-      // says. src/index.ts routes every veto to `settle` regardless of the definition
-      // (a veto is only actionable while the turn can still be reopened), so an
-      // `on: agent_settled` veto-capable observer is self-draining whatever `deliver`
-      // claims -- and reading `o.deliver` here would wave it through.
-      const effectiveDeliver = o.can.includes("veto") ? "settle" : o.deliver;
-      expect(SELF_DRAINING_TRIGGERS[o.on]).not.toBe(effectiveDeliver);
+      expect(selfDrains(o), o.name).toBe(false);
     }
     // Without this the test passes by checking nothing the day someone drops the last
     // veto-capable observer.
@@ -106,7 +130,7 @@ describe("bundled observers", () => {
     // definition and in the README. This test exists so the exception cannot quietly
     // grow a second member.
     const selfDraining = load()
-      .observers.filter((o) => SELF_DRAINING_TRIGGERS[o.on] === o.deliver)
+      .observers.filter(selfDrains)
       .map((o) => o.name);
     expect(selfDraining).toEqual(["skill-recall"]);
   });

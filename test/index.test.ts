@@ -660,6 +660,171 @@ describe("delivery", () => {
     expect(h.sent[0]?.message.content).toContain("verify before closing");
   });
 
+  it("delivers an advisory that a veto pre-empted at the NEXT settle, not never", async () => {
+    // drainFor("settle") SPLICES out of both `held` and the bus. When a veto is also
+    // pending, the handler returned and the drained advisories went out of scope: not
+    // re-held, not re-queued, not logged. Silent destruction of this extension's primary
+    // output, on the one turn the agent is being sent back to redo work.
+    const h = harness();
+    const advisory = p("adv", "the new test file has no assertions", { deliver: "settle" });
+    const veto = p("goal", "the stated goal is not met", { kind: "veto", deliver: "settle" });
+    const { ctx } = await bootWith(
+      h,
+      [
+        def({ name: "adv", on: "turn_end", deliver: "settle" }),
+        def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" }),
+      ],
+      { adv: emitting("adv", advisory), goal: emitting("goal", veto) },
+    );
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.message.customType).toBe("observer-veto");
+
+    // The redo finishes and settles again. The advisory must arrive now.
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent).toHaveLength(2);
+    expect(h.sent[1]?.message.customType).toBe("observer-advisory");
+    expect(h.sent[1]?.message.content).toContain("the new test file has no assertions");
+  });
+
+  it("does not redeliver a deferred advisory a second time", async () => {
+    const h = harness();
+    const advisory = p("adv", "deferred once", { deliver: "settle" });
+    const veto = p("goal", "not met", { kind: "veto", deliver: "settle" });
+    const { ctx } = await bootWith(
+      h,
+      [
+        def({ name: "adv", on: "turn_end", deliver: "settle" }),
+        def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" }),
+      ],
+      { adv: emitting("adv", advisory), goal: emitting("goal", veto) },
+    );
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    await fire(h, "agent_settled", {}, ctx);
+    await fire(h, "agent_settled", {}, ctx);
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent.filter((m) => m.message.customType === "observer-advisory")).toHaveLength(1);
+  });
+
+  it("bounds the deferral, so a veto storm cannot accumulate advisories without limit", async () => {
+    // Reachable, not hypothetical: src/settings.ts caps vetoBudget and
+    // maxAdvisoriesPerTurn at 10 each, so the session veto ceiling is 40 and each
+    // pre-empted settle can carry 10 advisories -- 400 deferrals against a bound of 100.
+    // Driven at exactly those limits so the bound is actually crossed rather than
+    // assumed unreachable.
+    const h = harness();
+    const ADVISORS = 10;
+    const definitions: ObserverDefinition[] = [];
+    const runners: Record<string, ObserverRunner> = {};
+    let round = 0;
+    // Two veto-capable observers with varying fingerprints: one alone stops at its own
+    // ceiling of 20, and the reconciler accepts at most one veto per turn, so two are
+    // what it takes to reach the session ceiling of 40.
+    for (let v = 0; v < 2; v++) {
+      const name = `goal-${v}`;
+      definitions.push(def({ name, on: "turn_end", can: ["veto"], deliver: "settle" }));
+      runners[name] = {
+        name,
+        run: async () =>
+          p(name, "not met", { kind: "veto", deliver: "settle", fingerprint: `v-${round}` }),
+        dispose() {},
+      };
+    }
+    for (let i = 0; i < ADVISORS; i++) {
+      const name = `adv-${i}`;
+      definitions.push(def({ name, on: "turn_end", deliver: "settle" }));
+      runners[name] = {
+        name,
+        run: async () =>
+          p(name, `advice ${round}-${i}`, { deliver: "settle", fingerprint: `f-${round}-${i}` }),
+        dispose() {},
+      };
+    }
+    const { ctx } = await bootWith(h, definitions, runners, {
+      readSettingsBlock: () => ({ vetoBudget: 10, maxAdvisoriesPerTurn: 10 }),
+    });
+
+    for (round = 0; round < 40; round++) {
+      await fire(h, "turn_end", {}, ctx);
+      await tick();
+      await fire(h, "agent_settled", {}, ctx);
+    }
+    // Every one of those settles was pre-empted by a veto -- confirm, or this test is
+    // measuring an ordinary delivery path.
+    expect(h.sent.every((m) => m.message.customType === "observer-veto")).toBe(true);
+    expect(h.sent).toHaveLength(40);
+
+    h.sent.length = 0;
+    await fire(h, "agent_settled", {}, ctx);
+    const delivered = String(h.sent[0]?.message.content ?? "");
+    const lines = delivered.split("\n").filter((l: string) => l.startsWith("- ["));
+    expect(lines.length).toBe(MAX_HELD_PROPOSALS);
+    // The bound drops the OLDEST, so the most recent advice is what survives.
+    expect(delivered).toContain("advice 39-9");
+    expect(delivered).not.toContain("advice 0-0");
+  });
+
+  it("aggregates replayed veto entries with a key that cannot collide", async () => {
+    // The session-entry scan groups entries by observer+fingerprint before handing them
+    // to restore(). A non-injective composite merges two DIFFERENT observers' entries
+    // into one, so one observer's spend is silently replayed as the other's -- which is
+    // why this site calls Reconciler.vetoKey rather than repeating a join.
+    const collide = [
+      {
+        type: "custom" as const,
+        customType: "observers-veto-spend",
+        data: { fingerprint: "b:c", observer: "a" },
+      },
+      {
+        type: "custom" as const,
+        customType: "observers-veto-spend",
+        data: { fingerprint: "c", observer: "a:b" },
+      },
+    ];
+    const h = harness([...collide, ...collide, ...collide]);
+    const d = def({ name: "a", on: "turn_end", can: ["veto"], deliver: "settle" });
+    const veto = p("a", "still not met", { kind: "veto", deliver: "settle", fingerprint: "b:c" });
+    const { ctx } = await bootWith(h, [d], { a: emitting("a", veto) });
+
+    // Observer "a" spent its full budget of 3 on fingerprint "b:c". If the two entry
+    // groups had merged, "a" would have been credited fewer than 3 and could veto again.
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent).toHaveLength(0);
+  });
+
+  it("does not carry a deferred advisory across a session boundary", async () => {
+    // /reload rebuilds the reconciler and the bus. A deferral that outlived that would
+    // deliver advice about a run the new session has no record of, and the dedupe set
+    // that would have suppressed it was rebuilt from entries at the same moment.
+    const h = harness();
+    const advisory = p("adv", "stale advice from the old session", { deliver: "settle" });
+    const veto = p("goal", "not met", { kind: "veto", deliver: "settle" });
+    const definitions = [
+      def({ name: "adv", on: "turn_end", deliver: "settle" }),
+      def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" }),
+    ];
+    const runners = { adv: emitting("adv", advisory), goal: emitting("goal", veto) };
+    const { ctx } = await bootWith(h, definitions, runners);
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent).toHaveLength(1); // the veto; the advisory is deferred
+
+    // Reload.
+    await fire(h, "session_start", {}, ctx);
+    h.sent.length = 0;
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent).toHaveLength(0);
+  });
+
   it("sends a veto as a turn-triggering follow-up", async () => {
     const h = harness();
     const d = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" });
