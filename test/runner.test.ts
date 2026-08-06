@@ -90,6 +90,44 @@ describe("createObserverRunner", () => {
     }));
   }
 
+  it("hands the session a settings manager that reads no settings file", async () => {
+    // The hermetic SettingsManager is the control the whole nested-session design rests
+    // on, and nothing pinned it: replacing SettingsManager.inMemory with
+    // SettingsManager.create(cwd, agentDir) left all 43 runner tests green. That swap is
+    // the recursion footgun -- an inherited settings file can re-enable extensions and
+    // skills inside an observer session -- and it also silently treats the checked-out
+    // repo's project settings as TRUSTED, since fromStorage defaults projectTrusted to
+    // true with no prompt.
+    const repo = mkdtempSync(join(tmpdir(), "pi-observers-runner-"));
+    mkdirSync(join(repo, ".pi"), { recursive: true });
+    writeFileSync(
+      join(repo, ".pi", "settings.json"),
+      JSON.stringify({ compaction: { enabled: false }, observers: { vetoBudget: 9 } }),
+    );
+
+    // biome-ignore lint/suspicious/noExplicitAny: capturing pi's SettingsManager
+    let captured: any;
+    const factory = vi.fn(async (opts: { settingsManager?: unknown }) => {
+      captured = opts.settingsManager;
+      return { session: { prompt: vi.fn(async () => {}), dispose: vi.fn() } };
+    });
+    const runner = await createObserverRunner({
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd: repo,
+      agentDir: join(repo, "agent"),
+      createSession: factory as never,
+    });
+    await runner.run({ lastUserMessage: "a" }, new AbortController().signal);
+
+    expect(captured).toBeDefined();
+    // The repo's settings file exists and says compaction is off; the observer session
+    // must not have seen any of it.
+    expect(captured.getProjectSettings()).toEqual({});
+    expect(captured.isProjectTrusted()).toBe(false);
+    rmSync(repo, { recursive: true, force: true });
+  });
+
   it("creates the session once and reuses it across runs", async () => {
     const factory = fakeSessionFactory(() => {});
     const runner = await createObserverRunner({

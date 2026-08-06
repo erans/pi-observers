@@ -3,12 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { discoverObservers } from "../src/discovery.ts";
+import { effectiveDeliveryPoint } from "../src/index.ts";
+import type { DeliveryPoint } from "../src/types.ts";
 
 const BUILTIN_DIR = join(import.meta.dirname, "..", "observers");
 
 function load() {
   const empty = mkdtempSync(join(tmpdir(), "pi-observers-bundled-"));
-  return discoverObservers({ cwd: empty, agentDir: empty, builtinDir: BUILTIN_DIR });
+  return discoverObservers({
+    cwd: empty,
+    agentDir: empty,
+    builtinDir: BUILTIN_DIR,
+    projectTrusted: true,
+  });
 }
 
 describe("bundled observers", () => {
@@ -83,13 +90,14 @@ describe("bundled observers", () => {
    * The invariant test below applies it to the real files, which is what must hold; this
    * is what makes the rule itself falsifiable, since nothing shipped violates it.
    */
-  const selfDrains = (o: { on: string; deliver: string; can: string[] }): boolean => {
-    // What matters is where the proposal is ACTUALLY drained, not what `deliver:` says.
-    // src/index.ts routes every veto to `settle` regardless of the definition (a veto is
-    // only actionable while the turn can still be reopened), so an `on: agent_settled`
-    // veto-capable observer is self-draining whatever `deliver` claims.
-    const effectiveDeliver = o.can.includes("veto") ? "settle" : o.deliver;
-    return SELF_DRAINING_TRIGGERS[o.on] === effectiveDeliver;
+  const selfDrains = (o: { on: string; deliver: DeliveryPoint; can: string[] }): boolean => {
+    // Calls the SHIPPED routing rule, not a copy of it. It was a copy, and a copy cannot
+    // disagree with itself: when src/index.ts and this file diverged, the test sided with
+    // this file and a veto being consumed at the wrong drain point went unnoticed through
+    // 600 tests. What matters is where the proposal is ACTUALLY drained -- for a veto,
+    // always `settle`, whatever `deliver:` says.
+    const kind = o.can.includes("veto") ? "veto" : "advisory";
+    return SELF_DRAINING_TRIGGERS[o.on] === effectiveDeliveryPoint({ kind, deliver: o.deliver });
   };
 
   it("recognises a self-draining configuration that does not ship", () => {

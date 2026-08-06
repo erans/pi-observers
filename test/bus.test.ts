@@ -39,6 +39,45 @@ describe("ProposalBus", () => {
     expect(bus.drain()).toEqual([]);
   });
 
+  it("aborts the run's signal when the timeout fires", async () => {
+    // The timeout does two things and only one was pinned: it settles the bus's own
+    // bookkeeping (counted, slot released), and it ABORTS the run so the nested session
+    // stops burning tokens. Deleting controller.abort() left all twenty bus tests green
+    // -- the observer would keep running, invisible and unbilled to anyone watching,
+    // until its own model call finished.
+    const bus = new ProposalBus();
+    let aborted = false;
+    bus.kick("o", 5, async (signal) => {
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => {
+          aborted = true;
+          resolve();
+        });
+      });
+      return null;
+    });
+    await bus.settle();
+    expect(aborted).toBe(true);
+    expect(bus.status("o").failures).toBe(1);
+  });
+
+  it("aborts every in-flight run on abortAll", async () => {
+    const bus = new ProposalBus();
+    let aborted = false;
+    bus.kick("o", 10_000, async (signal) => {
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => {
+          aborted = true;
+          resolve();
+        });
+      });
+      return null;
+    });
+    bus.abortAll();
+    await bus.settle();
+    expect(aborted).toBe(true);
+  });
+
   it("drops a re-kick while a run is in flight", async () => {
     const bus = new ProposalBus();
     const run = vi.fn(async () => {

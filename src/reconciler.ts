@@ -195,11 +195,12 @@ export class Reconciler {
       // the failure mode of ignoring it is an unsatisfiable goal holding every turn
       // open forever.
       //
-      // The clamp is storage hygiene and nothing more, stated plainly so no one later
-      // mistakes it for a control: `spent >= this.#vetoBudget` below compares the same
-      // way whether the stored value is the budget or MAX_SAFE_INTEGER, so clamping is
-      // behaviourally equivalent to storing the value verbatim. No test pins it, and
-      // none can.
+      // This WAS inert -- `spent >= this.#vetoBudget` compares the same way whether the
+      // stored value is the budget or MAX_SAFE_INTEGER -- and was labelled as such. It
+      // stopped being inert when the per-observer and session ceilings began to be
+      // credited from `spent`, because a ceiling is a SUM: an entry claiming a count of
+      // 4 against a budget of 3 costs a different amount of ceiling clamped than
+      // unclamped. It is now a control, and a test pins it.
       const spent = Math.min(count, this.#vetoBudget);
       // The ceilings are replayed first and unconditionally, or a reload refills them
       // and the runaway they exist to stop resumes with a clean slate.
@@ -217,6 +218,19 @@ export class Reconciler {
 
   accepted(): string[] {
     return [...this.#acceptedFingerprints];
+  }
+
+  /**
+   * Undo the dedupe record for an advisory that was accepted but never delivered.
+   *
+   * reconcile() adds to the accepted set at DECISION time, which is right for anything
+   * that reaches the user. A proposal that was accepted and then evicted by a downstream
+   * bound never reached anyone, and leaving its fingerprint in the set means the observer
+   * can never raise it again for the rest of the session -- the advice is destroyed
+   * twice, once by the eviction and once permanently.
+   */
+  forget(fingerprint: string): void {
+    this.#acceptedFingerprints.delete(fingerprint);
   }
 
   /**

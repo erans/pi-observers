@@ -10,6 +10,7 @@ import createExtension, {
   formatAdvisories,
   formatVeto,
   MAX_HELD_PROPOSALS,
+  MAX_TURN_TOOL_CALLS,
   type ObserverDeps,
   readObserverSettingsBlock,
 } from "../src/index.ts";
@@ -711,6 +712,96 @@ describe("delivery", () => {
     expect(h.sent.filter((m) => m.message.customType === "observer-advisory")).toHaveLength(1);
   });
 
+  it("counts an advisory as accepted when it is delivered, not when it is decided", async () => {
+    // Acceptance and delivery are different events with two bounds between them.
+    // Tallying at acceptance reported "40 runs, 40 accepted, 0 dropped" for an observer
+    // whose advice reached the agent ten times.
+    const h = harness();
+    const advisory = p("adv", "held behind a veto", { deliver: "settle" });
+    const veto = p("goal", "not met", { kind: "veto", deliver: "settle" });
+    const { ctx, notices } = await bootWith(
+      h,
+      [
+        def({ name: "adv", on: "turn_end", deliver: "settle" }),
+        def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" }),
+      ],
+      { adv: emitting("adv", advisory), goal: emitting("goal", veto) },
+    );
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    await fire(h, "agent_settled", {}, ctx); // veto wins; the advisory is deferred
+    await h.commands.get("observers")?.handler("", ctx);
+    const beforeDelivery = notices.at(-1)?.message ?? "";
+    expect(beforeDelivery).toMatch(/^adv \[on\].*0 accepted/m);
+    // ...and no dedupe entry has been written for something nobody has seen.
+    expect(h.entries.filter((e) => e.customType === "observers-accepted")).toHaveLength(0);
+
+    await fire(h, "agent_settled", {}, ctx);
+    await h.commands.get("observers")?.handler("", ctx);
+    const afterDelivery = notices.at(-1)?.message ?? "";
+    expect(afterDelivery).toMatch(/^adv \[on\].*1 accepted/m);
+    expect(h.entries.filter((e) => e.customType === "observers-accepted")).toHaveLength(1);
+  });
+
+  it("lets an observer raise a point again after the bound threw its advisory away", async () => {
+    // The second half of the same defect. reconcile() adds a fingerprint to the dedupe
+    // set at DECISION time, so an advisory that was accepted and then evicted was
+    // destroyed twice: once by the eviction, and once permanently, because the observer
+    // could never raise the point again for the rest of the session.
+    const h = harness();
+    const definitions: ObserverDefinition[] = [
+      def({ name: "adv", on: "turn_end", deliver: "settle" }),
+    ];
+    const runners: Record<string, ObserverRunner> = {
+      adv: emitting("adv", p("adv", "the point", { deliver: "settle", fingerprint: "stable" })),
+    };
+    let round = 0;
+    // Two veto-capable observers reach the session ceiling of 40 vetoed settles; twelve
+    // advisory observers fill the 100-entry deferral several times over within them.
+    for (let v = 0; v < 2; v++) {
+      const name = `goal-${v}`;
+      definitions.push(def({ name, on: "turn_end", can: ["veto"], deliver: "settle" }));
+      runners[name] = {
+        name,
+        run: async () =>
+          p(name, "not met", { kind: "veto", deliver: "settle", fingerprint: `v-${round}` }),
+        dispose() {},
+      };
+    }
+    for (let i = 0; i < 12; i++) {
+      const name = `noise-${i}`;
+      definitions.push(def({ name, on: "turn_end", deliver: "settle" }));
+      runners[name] = {
+        name,
+        run: async () =>
+          p(name, `filler ${round}-${i}`, { deliver: "settle", fingerprint: `n-${round}-${i}` }),
+        dispose() {},
+      };
+    }
+    const { ctx } = await bootWith(h, definitions, runners, {
+      readSettingsBlock: () => ({ vetoBudget: 10, maxAdvisoriesPerTurn: 10 }),
+    });
+
+    for (round = 0; round < 40; round++) {
+      await fire(h, "turn_end", {}, ctx);
+      await tick();
+      await fire(h, "agent_settled", {}, ctx);
+    }
+    expect(h.sent.every((m) => m.message.customType === "observer-veto")).toBe(true);
+    // "the point" was first into the deferral and is long gone.
+    expect(h.sent.map((m) => String(m.message.content)).join("\n")).not.toContain("the point");
+
+    // It was evicted, so the observer must be able to raise it again.
+    h.sent.length = 0;
+    for (round = 40; round < 100; round++) {
+      await fire(h, "turn_end", {}, ctx);
+      await tick();
+      await fire(h, "agent_settled", {}, ctx);
+    }
+    expect(h.sent.map((m) => String(m.message.content)).join("\n")).toContain("the point");
+  });
+
   it("bounds the deferral, so a veto storm cannot accumulate advisories without limit", async () => {
     // Reachable, not hypothetical: src/settings.ts caps vetoBudget and
     // maxAdvisoriesPerTurn at 10 each, so the session veto ceiling is 40 and each
@@ -745,7 +836,7 @@ describe("delivery", () => {
         dispose() {},
       };
     }
-    const { ctx } = await bootWith(h, definitions, runners, {
+    const { ctx, notices } = await bootWith(h, definitions, runners, {
       readSettingsBlock: () => ({ vetoBudget: 10, maxAdvisoriesPerTurn: 10 }),
     });
 
@@ -760,44 +851,78 @@ describe("delivery", () => {
     expect(h.sent).toHaveLength(40);
 
     h.sent.length = 0;
+    // Each settle delivers at most maxAdvisoriesPerTurn (10 here). The backlog used to
+    // ignore that cap entirely and dump the whole deferral in one message.
     await fire(h, "agent_settled", {}, ctx);
-    const delivered = String(h.sent[0]?.message.content ?? "");
+    const first = String(h.sent[0]?.message.content ?? "");
+    expect(first.split("\n").filter((l: string) => l.startsWith("- [")).length).toBe(10);
+
+    // Drain the rest, then count across every message actually sent (not `at(-1)` in a
+    // loop, which re-counts the last message once the queue empties).
+    for (let i = 0; i < 20; i++) await fire(h, "agent_settled", {}, ctx);
+    const delivered = h.sent.map((m) => String(m.message.content)).join("\n");
     const lines = delivered.split("\n").filter((l: string) => l.startsWith("- ["));
     expect(lines.length).toBe(MAX_HELD_PROPOSALS);
     // The bound drops the OLDEST, so the most recent advice is what survives.
     expect(delivered).toContain("advice 39-9");
     expect(delivered).not.toContain("advice 0-0");
+
+    // 400 advisories in, 100 delivered. The other 300 must be counted as DROPPED, or
+    // /observers reports every one of these observers as healthy while three quarters
+    // of their output was thrown away.
+    await h.commands.get("observers")?.handler("", ctx);
+    const status = notices.at(-1)?.message ?? "";
+    const totals = status.split("\n").reduce(
+      (acc, line) => {
+        // Advisory observers only: the veto observers' own accepted counts are a
+        // separate story and would mask this one.
+        if (!line.startsWith("adv-")) return acc;
+        const accepted = line.match(/(\d+) accepted/);
+        const dropped = line.match(/(\d+) dropped/);
+        if (accepted && dropped) {
+          acc.accepted += Number(accepted[1]);
+          acc.dropped += Number(dropped[1]);
+        }
+        return acc;
+      },
+      { accepted: 0, dropped: 0 },
+    );
+    expect(totals.accepted).toBe(MAX_HELD_PROPOSALS);
+    expect(totals.dropped).toBe(400 - MAX_HELD_PROPOSALS);
+    expect(status).toMatch(/deferral bound/);
   });
 
-  it("aggregates replayed veto entries with a key that cannot collide", async () => {
-    // The session-entry scan groups entries by observer+fingerprint before handing them
-    // to restore(). A non-injective composite merges two DIFFERENT observers' entries
-    // into one, so one observer's spend is silently replayed as the other's -- which is
-    // why this site calls Reconciler.vetoKey rather than repeating a join.
-    const collide = [
-      {
-        type: "custom" as const,
-        customType: "observers-veto-spend",
-        data: { fingerprint: "b:c", observer: "a" },
-      },
-      {
-        type: "custom" as const,
-        customType: "observers-veto-spend",
-        data: { fingerprint: "c", observer: "a:b" },
-      },
-    ];
-    const h = harness([...collide, ...collide, ...collide]);
-    const d = def({ name: "a", on: "turn_end", can: ["veto"], deliver: "settle" });
-    const veto = p("a", "still not met", { kind: "veto", deliver: "settle", fingerprint: "b:c" });
-    const { ctx } = await bootWith(h, [d], { a: emitting("a", veto) });
+  // Both separators this site has used are checked. Reverting to either is caught.
+  for (const [label, left, right] of [
+    ["colon", "b:c", "a:b"],
+    ["NUL", "b\u0000c", "a\u0000b"],
+  ] as const) {
+    it(`aggregates replayed veto entries without colliding on a ${label} in either part`, async () => {
+      const collide = [
+        {
+          type: "custom" as const,
+          customType: "observers-veto-spend",
+          data: { fingerprint: left, observer: "a" },
+        },
+        {
+          type: "custom" as const,
+          customType: "observers-veto-spend",
+          data: { fingerprint: "c", observer: right },
+        },
+      ];
+      const h = harness([...collide, ...collide, ...collide]);
+      const d = def({ name: "a", on: "turn_end", can: ["veto"], deliver: "settle" });
+      const veto = p("a", "still not met", { kind: "veto", deliver: "settle", fingerprint: left });
+      const { ctx } = await bootWith(h, [d], { a: emitting("a", veto) });
 
-    // Observer "a" spent its full budget of 3 on fingerprint "b:c". If the two entry
-    // groups had merged, "a" would have been credited fewer than 3 and could veto again.
-    await fire(h, "turn_end", {}, ctx);
-    await tick();
-    await fire(h, "agent_settled", {}, ctx);
-    expect(h.sent).toHaveLength(0);
-  });
+      // Observer "a" spent its full budget of 3 on `left`. If the two entry groups had
+      // merged, "a" would have been credited fewer than 3 and could veto again.
+      await fire(h, "turn_end", {}, ctx);
+      await tick();
+      await fire(h, "agent_settled", {}, ctx);
+      expect(h.sent).toHaveLength(0);
+    });
+  }
 
   it("does not carry a deferred advisory across a session boundary", async () => {
     // /reload rebuilds the reconciler and the bus. A deferral that outlived that would
@@ -823,6 +948,136 @@ describe("delivery", () => {
     h.sent.length = 0;
     await fire(h, "agent_settled", {}, ctx);
     expect(h.sent).toHaveLength(0);
+  });
+
+  /**
+   * The routing invariant, stated over outcomes rather than over configuration.
+   *
+   * The suite tested DEFINITIONS where it needed to test ROUTING: test/bundled.test.ts
+   * checked that no bundled definition sat on its own delivery point, using its own copy
+   * of the rule -- and a copy cannot disagree with itself, so when the copy and
+   * src/index.ts diverged the test sided with the copy. 600 tests missed a veto being
+   * consumed at the wrong drain point because none of them asked the only question that
+   * matters: what happened to the proposal?
+   *
+   * Every proposal entering drainFor must end up delivered, still held, or counted as
+   * dropped. There is no fourth outcome, and "spent, tallied, and discarded" was one.
+   */
+  for (const kind of ["advisory", "veto"] as const) {
+    for (const deliver of ["next_prompt", "next_turn", "settle"] as const) {
+      it(`accounts for every ${kind} declaring deliver: ${deliver}`, async () => {
+        const h = harness();
+        const d = def({
+          name: "obs",
+          on: "turn_end",
+          deliver,
+          can: kind === "veto" ? ["veto"] : ["advise"],
+        });
+        const proposal = p("obs", "the one and only proposal", { kind, deliver });
+        const { ctx, notices } = await bootWith(h, [d], { obs: emitting("obs", proposal) });
+
+        await fire(h, "turn_end", {}, ctx);
+        await tick();
+        // Two full cycles, so a proposal held past its first chance still gets one.
+        const rendered: string[] = [];
+        for (let cycle = 0; cycle < 2; cycle++) {
+          const fromPrompt = await fire(h, "before_agent_start", {}, ctx);
+          if (fromPrompt?.message) rendered.push(String(fromPrompt.message.content));
+          const fromContext = await fire(h, "context", { messages: [] }, ctx);
+          if (fromContext?.messages) rendered.push(JSON.stringify(fromContext.messages));
+          await fire(h, "agent_settled", {}, ctx);
+        }
+        for (const sent of h.sent) rendered.push(String(sent.message.content));
+
+        await h.commands.get("observers")?.handler("", ctx);
+        const status = notices.at(-1)?.message ?? "";
+        const dropped = Number(status.match(/(\d+) dropped/)?.[1] ?? 0);
+        const delivered = rendered.filter((r) => r.includes("the one and only proposal")).length;
+
+        // Exactly one outcome, exactly once. Delivered twice would be as wrong as never.
+        expect(delivered + dropped, `delivered=${delivered} dropped=${dropped}`).toBe(1);
+        // And whatever happened, the accepted tally agrees with what was shown.
+        const accepted = Number(status.match(/(\d+) accepted/)?.[1] ?? 0);
+        expect(accepted).toBe(delivered);
+      });
+    }
+  }
+
+  it("passes the project's trust state through to discovery", async () => {
+    // The gate lives in src/discovery.ts, but a caller that hardcodes `true` disables it
+    // without touching the gate. This pins the wire, not the gate.
+    const seen: Array<boolean> = [];
+    for (const trusted of [true, false]) {
+      const h = harness();
+      const { ctx } = makeCtx({
+        cwd,
+        entries: h.entries,
+        model: { provider: "p", id: "m" },
+        projectTrusted: trusted,
+      });
+      createExtension(
+        h.pi,
+        deps({
+          discover: (opts) => {
+            seen.push(opts.projectTrusted);
+            return { observers: [], errors: [] };
+          },
+        }),
+      );
+      await fire(h, "session_start", {}, ctx);
+    }
+    expect(seen).toEqual([true, false]);
+  });
+
+  it("routes a veto to settle even when its definition declares another point", async () => {
+    // The routing rule was a disjunction, and its FIRST clause matched too: a
+    // `deliver: next_prompt` veto was consumed at before_agent_start, where budget was
+    // spent and the proposal was tallied -- and then dropped, because that handler
+    // renders advisories only. Its effect surfaced a turn later, reopening a turn whose
+    // work it had never seen.
+    const h = harness();
+    const d = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "next_prompt" });
+    const veto = p("goal", "the stated goal is not met", {
+      kind: "veto",
+      deliver: "next_prompt",
+    });
+    const { ctx } = await bootWith(h, [d], { goal: emitting("goal", veto) });
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    // The wrong drain point must not consume it.
+    const early = await fire(h, "before_agent_start", {}, ctx);
+    expect(early).toBeUndefined();
+    expect(h.entries.filter((e) => e.customType === "observers-veto-spend")).toHaveLength(0);
+
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.message.customType).toBe("observer-veto");
+  });
+
+  it("never spends veto budget for a veto it does not deliver", async () => {
+    // The accounting form of the same defect: budget spent for [a, b], delivered [b].
+    const h = harness();
+    const definitions = ["a", "b"].map((n) =>
+      def({ name: n, on: "turn_end", can: ["veto"], deliver: "next_prompt" }),
+    );
+    const runners = {
+      a: emitting("a", p("a", "veto a", { kind: "veto", deliver: "next_prompt" })),
+      b: emitting("b", p("b", "veto b", { kind: "veto", deliver: "settle" })),
+    };
+    const { ctx } = await bootWith(h, definitions, runners);
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    await fire(h, "before_agent_start", {}, ctx);
+    await fire(h, "agent_settled", {}, ctx);
+
+    const spent = h.entries.filter((e) => e.customType === "observers-veto-spend");
+    const delivered = h.sent.filter((m) => m.message.customType === "observer-veto");
+    // One veto accepted per turn, and the budget records exactly the one that was sent.
+    expect(spent).toHaveLength(1);
+    expect(delivered).toHaveLength(1);
+    expect(String(delivered[0]?.message.content)).toContain(String(spent[0]?.data.observer));
   });
 
   it("sends a veto as a turn-triggering follow-up", async () => {
@@ -943,6 +1198,86 @@ describe("delivery", () => {
     const state = seen.at(-1);
     expect(state?.lastAssistantMessage).toBe("I ran the tests");
     expect(state?.toolCallsThisTurn?.map((c) => c.name)).toEqual(["bash"]);
+  });
+
+  it("keeps head AND tail when the tool-call bound bites", async () => {
+    // `shift()` kept the tail, which makes the cap a hiding place: flood the record with
+    // benign calls and everything before them is evicted. src/slices.ts keeps head and
+    // tail for exactly this reason; doing it there and not here just moves the flood one
+    // layer up. Executed against the old code: the payload was gone.
+    const h = harness();
+    const seen: SliceState[] = [];
+    const d = def({ name: "obs", on: "tool_execution_end", sees: ["tool_calls_this_turn"] });
+    const { ctx } = await bootWith(h, [d], {
+      obs: {
+        name: "obs",
+        async run(state: SliceState) {
+          seen.push(state);
+          return null;
+        },
+        dispose() {},
+      },
+    });
+
+    await fire(h, "before_agent_start", {}, ctx);
+    const call = async (id: string, name: string) => {
+      await fire(h, "tool_execution_start", { toolCallId: id, toolName: name, args: {} }, ctx);
+      await fire(h, "tool_execution_end", { toolCallId: id, toolName: name, isError: false }, ctx);
+    };
+    await call("payload", "exfiltrate");
+    for (let i = 0; i < 2000; i++) await call(`f${i}`, "read");
+    await tick();
+
+    const names = seen.at(-1)?.toolCallsThisTurn?.map((c) => c.name) ?? [];
+    expect(names).toContain("exfiltrate");
+    expect(names.length).toBeLessThanOrEqual(MAX_TURN_TOOL_CALLS);
+    // The tail survives too, or the fix would just invert the hiding place.
+    expect(names.at(-1)).toBe("read");
+  });
+
+  it("says how many tool calls the bound discarded", async () => {
+    // src/slices.ts computes its shown/total from the array it receives, so after
+    // eviction that total describes what survived, not what happened. The gap is
+    // announced in-band instead, and placed first so it survives slices.ts's own
+    // head-and-tail render.
+    const h = harness();
+    const seen: SliceState[] = [];
+    const d = def({ name: "obs", on: "tool_execution_end", sees: ["tool_calls_this_turn"] });
+    const { ctx } = await bootWith(h, [d], {
+      obs: {
+        name: "obs",
+        async run(state: SliceState) {
+          seen.push(state);
+          return null;
+        },
+        dispose() {},
+      },
+    });
+    await fire(h, "before_agent_start", {}, ctx);
+    for (let i = 0; i < 2000; i++) {
+      await fire(
+        h,
+        "tool_execution_start",
+        { toolCallId: `f${i}`, toolName: "read", args: {} },
+        ctx,
+      );
+      await fire(
+        h,
+        "tool_execution_end",
+        { toolCallId: `f${i}`, toolName: "read", isError: false },
+        ctx,
+      );
+    }
+    await tick();
+
+    const calls = seen.at(-1)?.toolCallsThisTurn ?? [];
+    const marker = calls[0];
+    expect(marker?.name).toContain("omitted");
+    // 2000 recorded, 499 head + 500 tail... the exact figure is what matters: it must
+    // account for every discarded call, not just the ones dropped by the last compaction.
+    expect(marker?.args).toBe(
+      `${2000 - (calls.length - 1)} tool call(s) from the middle of this run are not shown`,
+    );
   });
 
   it("bounds the tool-call record over a very long agent run", async () => {
@@ -1322,11 +1657,16 @@ describe("delivery", () => {
         return accepted && dropped ? [Number(accepted[1]) + Number(dropped[1])] : [];
       })
       .reduce((a, b) => a + b, 0);
-    expect(tallied).toBe(MAX_HELD_PROPOSALS);
+    // Every proposal is accounted for, INCLUDING the one the bound discarded. It used
+    // to vanish: 101 proposals in, 100 accounted for, and the observer whose advice was
+    // thrown away reported "0 accepted, 0 dropped" -- indistinguishable from an observer
+    // that had chosen to stay silent.
+    expect(tallied).toBe(count);
     // Oldest first: obs0 is the one the bound discarded.
     const rowZero = status.split("\n").find((l) => l.startsWith("obs0 "));
     expect(rowZero).toContain("0 accepted");
-    expect(rowZero).toContain("0 dropped");
+    expect(rowZero).toContain("1 dropped");
+    expect(status).toMatch(/obs0: 1 proposal\(s\) dropped; most recent - .*hold bound/);
   });
 
   it("pairs tool arguments captured at execution start onto the record at end", async () => {
@@ -1573,6 +1913,90 @@ describe("observer status notes", () => {
     const out = await s.read();
     expect(out).toContain("obs: STOPPED after 3 consecutive failures");
     expect(out).toContain("no API key for provider");
+  });
+
+  it("reports CONSECUTIVE failures in the STOPPED line, not total failures", async () => {
+    // The line said "STOPPED after N consecutive failures" while printing the TOTAL,
+    // so an observer that failed, recovered, then failed three times reported "STOPPED
+    // after 4 consecutive failures" -- a number that contradicts the threshold it names
+    // and sends the reader looking for a fourth failure that never happened.
+    let fail = true;
+    const flaky: ObserverRunner = {
+      name: "obs",
+      async run() {
+        if (fail) throw new Error("provider returned 429");
+        return null;
+      },
+      dispose() {},
+    };
+    const s = await status({ createRunner: async () => flaky });
+    // One failure, then a success that resets the streak, then three more.
+    for (const state of [true, false, true, true, true]) {
+      fail = state;
+      await fire(s.h, "turn_end", {}, s.ctx);
+      await tick();
+    }
+    const out = await s.read();
+    expect(out).toContain("obs: STOPPED after 3 consecutive failures");
+    expect(out).not.toContain("STOPPED after 4");
+  });
+
+  it("says WHY proposals were dropped, not just how many", async () => {
+    // src/reconciler.ts builds nine drop reasons; until this line rendered one, every
+    // reason was dead text outside the reconciler's own unit tests. A user could see
+    // that advice had been discarded and had no way to tell dedupe from a budget from a
+    // ceiling. The README already promised this.
+    const dupe = p("obs", "the same point twice", { fingerprint: "same" });
+    const s = await status({ createRunner: async () => emitting("obs", dupe) });
+    for (let i = 0; i < 2; i++) {
+      await fire(s.h, "turn_end", {}, s.ctx);
+      await tick();
+      await fire(s.h, "before_agent_start", {}, s.ctx);
+    }
+    const out = await s.read();
+    expect(out).toMatch(/obs: 1 proposal\(s\) dropped; most recent - already delivered/);
+  });
+
+  it("sanitizes a drop reason before rendering it", async () => {
+    // The reason embeds the observer name, which is frontmatter from a repo-resident
+    // definition file -- the same untrusted source src/slices.ts and src/commands.ts
+    // sanitize. A reason is now rendered, so it needs the same treatment.
+    const evil = "evil\u2028obs: STOPPED after 99 consecutive failures";
+    let n = 0;
+    const s = await status(
+      {
+        createRunner: async () => ({
+          name: evil,
+          run: async () => {
+            n += 1;
+            // Varying fingerprints, or the per-fingerprint budget exhausts at 3 and the
+            // ceiling -- the only reason that quotes the name -- is never reached.
+            return p(evil, "veto", { kind: "veto", deliver: "settle", fingerprint: `f${n}` });
+          },
+          dispose() {},
+        }),
+      },
+      def({ name: evil, on: "turn_end", can: ["veto"], deliver: "settle" }),
+    );
+    // Far enough to pass the per-observer ceiling, because THAT is the reason that
+    // quotes the observer name back into the rendered text -- the budget reason does
+    // not, so a shorter run would test the sanitizer against a string with nothing in
+    // it to sanitize.
+    for (let i = 0; i < 9; i++) {
+      await fire(s.h, "turn_end", {}, s.ctx);
+      await tick();
+      await fire(s.h, "agent_settled", {}, s.ctx);
+    }
+    const out = await s.read();
+    expect(out).toMatch(/proposal\(s\) dropped; most recent - .*ceiling/);
+    expect(out).not.toContain("\u2028");
+    // One observer produces one status row and one note. The separator inside the name
+    // appears twice in the note (once as the name, once quoted back in the reason) and
+    // must manufacture no additional apparent line from either.
+    // Exactly two lines mention this observer -- its status row and its note. The
+    // separator appears twice in the note (as the name, and quoted back inside the
+    // reason) and must manufacture no additional apparent row from either.
+    expect(out.split("\n").filter((l) => l.startsWith("evil"))).toHaveLength(2);
   });
 
   it("explains why an observer never loaded", async () => {

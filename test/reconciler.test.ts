@@ -478,6 +478,40 @@ describe("Reconciler", () => {
       expect(r.stateSize().vetoObservers).toBe(1000);
     });
 
+    it("bounds the spend map for a single observer with many fingerprints", () => {
+      // The other half of the cap. One observer emitting 5000 distinct fingerprints is
+      // the shape a runaway model actually produces, and the existing test used 5000
+      // distinct OBSERVERS -- so a mutant removing the cap grew vetoSpend to 5000 here
+      // and nothing noticed.
+      const r = new Reconciler({ vetoBudget: 1 });
+      r.restore(
+        [],
+        Array.from({ length: 5000 }, (_, i) => ({
+          observer: "one",
+          fingerprint: `fp-${i}`,
+          count: 1,
+        })),
+      );
+      expect(r.stateSize().vetoSpend).toBe(1000);
+      expect(r.stateSize().vetoObservers).toBe(1);
+    });
+
+    it("clamps a replayed count to the budget rather than storing it verbatim", () => {
+      // This clamp used to be inert -- `spent >= budget` compared the same way whether
+      // the stored value was the budget or MAX_SAFE_INTEGER. It stopped being inert when
+      // the ceiling started being credited from `spent`, because the ceiling is a SUM.
+      // An entry claiming a count of 4 against a budget of 3 now costs a different
+      // amount of ceiling depending on whether it is clamped.
+      const r = new Reconciler({ vetoBudget: 3 });
+      r.restore([], [{ observer: "o", fingerprint: "g", count: 4 }]);
+      let accepted = 0;
+      for (let i = 0; i < 10; i++) {
+        if (r.reconcile([p({ kind: "veto", fingerprint: `f-${i}` })]).veto) accepted += 1;
+      }
+      // Ceiling 6, of which the replay spends 3 (clamped), not 4.
+      expect(accepted).toBe(3);
+    });
+
     it("bounds the restored fingerprint set too", () => {
       const r = new Reconciler();
       r.restore(

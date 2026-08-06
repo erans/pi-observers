@@ -410,6 +410,29 @@ const DEFAULT_DEPS: ObserverDeps = {
 };
 
 /**
+ * Where a proposal is ACTUALLY drained, which for a veto is never what it declared.
+ *
+ * Holding a turn open is only meaningful at `settle`, so a veto is settled there
+ * whatever its definition says. The rule used to be written as a disjunction --
+ * `deliver === point || (kind === "veto" && point === "settle")` -- and the first clause
+ * matched too: a `deliver: next_prompt` veto was ALSO consumed at `before_agent_start`,
+ * where it spent budget, was tallied, and was then dropped on the floor, because that
+ * handler renders advisories only. Its effect appeared one turn later, reopening a turn
+ * whose work it had never seen. The comment above the disjunction asserted this could
+ * not happen.
+ *
+ * Exported because test/bundled.test.ts once had its own hand-written copy of this rule
+ * for checking definitions. A copy cannot disagree with itself, so when the copy and the
+ * implementation diverged the test agreed with the copy. It calls this now.
+ */
+export function effectiveDeliveryPoint(proposal: {
+  kind: Proposal["kind"];
+  deliver: DeliveryPoint;
+}): DeliveryPoint {
+  return proposal.kind === "veto" ? "settle" : proposal.deliver;
+}
+
+/**
  * Bound on proposals held for a delivery point that has not arrived yet.
  *
  * A proposal drained at the wrong delivery point is put back, not dropped. Without a
@@ -420,7 +443,16 @@ const DEFAULT_DEPS: ObserverDeps = {
 export const MAX_HELD_PROPOSALS = 100;
 
 /** Bound on tool-call records kept for one agent run. */
-const MAX_TURN_TOOL_CALLS = 500;
+export const MAX_TURN_TOOL_CALLS = 500;
+/**
+ * Name of the synthetic entry compactToolCalls inserts to announce an elision.
+ *
+ * Not a security boundary -- a real tool could be called this, and an agent could emit a
+ * fake one. The property that matters is that the TAIL cannot be evicted; this only
+ * makes the gap legible, since the shown/total counts on the marker line are computed
+ * by src/slices.ts from the array it receives and cannot see what was dropped here.
+ */
+const ELIDED_TOOL_NAME = "(omitted by pi-observers)";
 
 /** Bound on in-flight tool-call arguments awaiting their tool_execution_end. */
 const MAX_PENDING_TOOL_ARGS = 200;
@@ -451,6 +483,8 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   let bus = new ProposalBus();
   let loaded: Loaded[] = [];
   let turnToolCalls: ToolCallRecord[] = [];
+  /** Running count of tool calls discarded by compactToolCalls, for the in-band marker. */
+  let omittedToolCalls = 0;
   let goalDiagnosis: GoalDiagnosis = { state: "unset" };
 
   /** Arguments seen at tool_execution_start, keyed by toolCallId.
@@ -478,9 +512,15 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   let pendingVeto: Proposal | null = null;
 
   /** Per-observer accepted/dropped counts for the /observers command. */
-  const tallies = new Map<string, { accepted: number; dropped: number }>();
+  interface Tally {
+    accepted: number;
+    dropped: number;
+    /** Why the most recent drop happened. Rendered by /observers; see observerNotes. */
+    lastDropReason?: string;
+  }
+  const tallies = new Map<string, Tally>();
 
-  function tallyFor(name: string): { accepted: number; dropped: number } {
+  function tallyFor(name: string): Tally {
     let tally = tallies.get(name);
     if (!tally) {
       tally = { accepted: 0, dropped: 0 };
@@ -515,7 +555,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
 
       if (status.disabled) {
         notes.push(
-          `${name}: STOPPED after ${status.failures} consecutive failures; last error: ${lastError}`,
+          `${name}: STOPPED after ${status.consecutiveFailures} consecutive failures; last error: ${lastError}`,
         );
       } else if (!entry.active) {
         // `note` carries the model-resolution reason or the runner build error, neither
@@ -531,6 +571,17 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
         notes.push(
           `${name}: ${status.failures} of ${status.runs} runs failed; last error: ${lastError}`,
         );
+      } else if (tally.dropped > 0 && tally.lastDropReason !== undefined) {
+        // src/reconciler.ts builds nine distinct drop reasons and this branch is the
+        // only thing in src/ that renders any of them. Before it, every one was dead
+        // text outside the reconciler's own unit tests: /observers showed a dropped
+        // COUNT, so a user could see that advice was discarded but never why -- dedupe,
+        // per-turn budget, veto budget, per-observer ceiling and session ceiling all
+        // looked identical. The reason is model- and definition-influenced text, so it
+        // goes through the same oneLine() sanitizer as every other rendered field.
+        notes.push(
+          `${name}: ${tally.dropped} proposal(s) dropped; most recent - ${oneLine(tally.lastDropReason, MAX_NOTE_CHARS)}`,
+        );
       } else if (tally.accepted === 0 && tally.dropped === 0) {
         // The line that closes the ambiguity: it ran, it worked, it chose to say
         // nothing. That is the common and correct outcome.
@@ -540,9 +591,64 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     return notes;
   }
 
+  /**
+   * Bound the tool-call record head-and-tail, never by dropping the head.
+   *
+   * `shift()` kept the tail, which reads as the safe choice and is the opposite. It
+   * makes the cap a hiding place one layer above the one src/slices.ts closes: 2001 tool
+   * calls evict everything before the last 500, so an agent that ran something it should
+   * not have can bury it under a flood of benign reads and the record handed to a
+   * verification observer contains no trace. src/slices.ts keeps head AND tail for
+   * exactly this reason; this layer has to as well, or the flood simply happens here
+   * instead.
+   *
+   * The elision is announced in-band. src/slices.ts derives its `total=` from the array
+   * length it is handed, so after eviction that number reports what survived rather than
+   * what happened; a synthetic first entry says how many are missing. It is placed
+   * FIRST, not at the join, because slices.ts renders only the first and last 50 entries
+   * of what it receives and a marker in the middle of 500 would never be shown.
+   */
+  function compactToolCalls(): void {
+    const head = Math.floor(MAX_TURN_TOOL_CALLS / 2);
+    const tail = MAX_TURN_TOOL_CALLS - head - 1; // one slot for the marker
+    // The previous marker is stripped before measuring, not carried through the head.
+    // Keeping it means every compaction prepends another one, and after enough of them
+    // the accumulated markers push the real head out -- restoring the exact hiding place
+    // this function exists to close. (Observed: the payload survived 1 compaction and
+    // was gone after 1500.)
+    const real = turnToolCalls.filter((call) => call.name !== ELIDED_TOOL_NAME);
+    omittedToolCalls += Math.max(0, real.length - head - tail);
+    turnToolCalls = [
+      {
+        name: ELIDED_TOOL_NAME,
+        args: `${omittedToolCalls} tool call(s) from the middle of this run are not shown`,
+        isError: false,
+      },
+      ...real.slice(0, head),
+      ...real.slice(Math.max(head, real.length - tail)),
+    ];
+  }
+
+  function noteDrop(proposal: Proposal, reason: string): void {
+    const tally = tallyFor(proposal.observer);
+    tally.dropped += 1;
+    tally.lastDropReason = reason;
+  }
+
   function requeue(proposal: Proposal): void {
     held.push(proposal);
-    if (held.length > MAX_HELD_PROPOSALS) held.shift();
+    // An eviction here is a proposal that will never be delivered. It has not been
+    // reconciled yet, so nothing has been tallied or written for it -- but silence would
+    // still leave /observers reporting an observer as healthy while its output vanished.
+    if (held.length > MAX_HELD_PROPOSALS) {
+      const evicted = held.shift();
+      if (evicted) {
+        noteDrop(
+          evicted,
+          `waiting for delivery at "${evicted.deliver}", evicted by the ${MAX_HELD_PROPOSALS}-proposal hold bound`,
+        );
+      }
+    }
   }
 
   /** Same bound as `held`: a deferral must not become an unbounded accumulation path. */
@@ -550,8 +656,37 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     for (const advisory of advisories) {
       deferredSettleAdvisories.push(advisory);
       if (deferredSettleAdvisories.length > MAX_HELD_PROPOSALS) {
-        deferredSettleAdvisories.shift();
+        const evicted = deferredSettleAdvisories.shift();
+        if (evicted) {
+          // These HAVE been through reconcile(), so two records exist that say the
+          // advisory was accepted and must both be undone: the tally, and the
+          // reconciler's dedupe set. Leaving the latter alone means the observer can
+          // never raise this point again for the whole session.
+          noteDrop(
+            evicted,
+            `held for delivery at settle, then evicted by the ${MAX_HELD_PROPOSALS}-proposal deferral bound`,
+          );
+          reconciler.forget(evicted.fingerprint);
+        }
       }
+    }
+  }
+
+  /**
+   * Record advisories at the moment they actually reach the agent, not when the
+   * reconciler accepts them.
+   *
+   * Accepting and delivering are different events and this branch has two bounds
+   * between them (the deferral, and the per-turn cap below). Tallying at acceptance
+   * reported `40 accepted, 0 dropped` for an observer whose advice was shown ten times,
+   * and wrote 400 dedupe entries for 100 delivered advisories -- entries that survive a
+   * reload while the undelivered proposals do not, so the observer could never raise
+   * those points again.
+   */
+  function recordDelivered(advisories: Proposal[]): void {
+    for (const advisory of advisories) {
+      tallyFor(advisory.observer).accepted += 1;
+      pi.appendEntry(ACCEPTED_ENTRY, { fingerprint: advisory.fingerprint });
     }
   }
 
@@ -592,9 +727,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
 
     const mine: Proposal[] = [];
     for (const proposal of all) {
-      // A veto is always settled at `settle`, whatever delivery point it declared:
-      // holding the turn open is only meaningful there.
-      if (proposal.deliver === point || (proposal.kind === "veto" && point === "settle")) {
+      if (effectiveDeliveryPoint(proposal) === point) {
         mine.push(proposal);
       } else {
         requeue(proposal);
@@ -617,16 +750,14 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     // what across calls, and the bus only counts runs -- so an observer that runs
     // constantly and has everything dropped would otherwise look identical to a healthy
     // one. This is the only place both outcomes are visible.
-    for (const advisory of advisories) tallyFor(advisory.observer).accepted += 1;
+    // A veto is tallied here because it is sent by the same handler that drains it,
+    // with nothing between. Advisories are tallied at recordDelivered instead.
     if (veto) tallyFor(veto.observer).accepted += 1;
     // ReconcileResult["dropped"] is Array<{ proposal, reason }>, NOT bare proposals.
     // `d.observer` would compile to undefined and every dropped tally would silently
     // count zero under a column that still looked plausible.
-    for (const drop of dropped) tallyFor(drop.proposal.observer).dropped += 1;
+    for (const drop of dropped) noteDrop(drop.proposal, drop.reason);
 
-    for (const advisory of advisories) {
-      pi.appendEntry(ACCEPTED_ENTRY, { fingerprint: advisory.fingerprint });
-    }
     return advisories;
   }
 
@@ -656,6 +787,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     deferredSettleAdvisories.length = 0;
     pendingVeto = null;
     turnToolCalls = [];
+    omittedToolCalls = 0;
     pendingToolArgs.clear();
     tallies.clear();
 
@@ -700,6 +832,9 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       cwd: ctx.cwd,
       agentDir: getAgentDir(),
       builtinDir: BUILTIN_DIR,
+      // The same gate the settings block gets, for content that is far more powerful:
+      // a definition is executed, not rendered.
+      projectTrusted: ctx.isProjectTrusted(),
     });
 
     for (const error of errors) {
@@ -762,10 +897,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       args: pendingToolArgs.get(event.toolCallId) ?? "",
       isError: Boolean(event.isError),
     });
-    // The list now spans a whole agent run, so it needs its own bound. src/slices.ts
-    // renders at most 100 entries (head and tail) whatever it is given; this only stops
-    // a very long run from growing the array itself without limit.
-    if (turnToolCalls.length > MAX_TURN_TOOL_CALLS) turnToolCalls.shift();
+    if (turnToolCalls.length > MAX_TURN_TOOL_CALLS) compactToolCalls();
     pendingToolArgs.delete(event.toolCallId);
     kickAll("tool_execution_end", ctx);
   });
@@ -801,6 +933,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     kickAll("before_agent_start", ctx);
     const advisories = drainFor("next_prompt");
     if (advisories.length === 0) return;
+    recordDelivered(advisories);
     return {
       message: {
         customType: "observer-advisory",
@@ -813,6 +946,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   pi.on("context", async (event) => {
     const advisories = drainFor("next_turn");
     if (advisories.length === 0) return;
+    recordDelivered(advisories);
     return {
       messages: [
         ...event.messages,
@@ -849,11 +983,17 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       return;
     }
 
-    const advisories = [
+    const queued = [
       ...deferredSettleAdvisories.splice(0, deferredSettleAdvisories.length),
       ...drained,
     ];
+    // The deferral bypassed maxAdvisoriesPerTurn: the reconciler caps each BATCH, and a
+    // backlog is many batches, so a run of vetoed settles could dump 100 advisories at
+    // once against a configured cap of 2. Oldest first, surplus stays deferred.
+    const advisories = queued.slice(0, settings.maxAdvisoriesPerTurn);
+    deferSettleAdvisories(queued.slice(settings.maxAdvisoriesPerTurn));
     if (advisories.length > 0) {
+      recordDelivered(advisories);
       pi.sendMessage(
         { customType: "observer-advisory", content: formatAdvisories(advisories), display: true },
         { deliverAs: "followUp" },

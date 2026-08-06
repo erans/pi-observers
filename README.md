@@ -119,8 +119,19 @@ format needs to change.
 The same mechanism, one delivery point over. `verification` triggers at `agent_settled`
 and delivers at `next_prompt`, which is drained at `before_agent_start` -- so if you
 close the session, or never send another request, its advice about the run that just
-finished is never shown. Nothing is lost from an earlier run: unshown advisories are
-held and delivered at your next request, bounded to the most recent 100.
+finished is never shown.
+
+Advice that misses its moment is deferred rather than discarded, in two places, and both
+are bounded at 100 proposals with the oldest dropped first:
+
+- a proposal whose delivery point has not come round yet waits for it;
+- an advisory that was ready at a `settle` where a veto took priority waits for the next
+  `settle`, and is then released at no more than `maxAdvisoriesPerTurn` per turn.
+
+The second queue does not survive a `/reload`, and either queue can drop its oldest
+entries under sustained load. When that happens the advisory is counted as **dropped**
+for its observer in `/observers`, with the reason, and the observer is free to raise the
+same point again -- it is not silently recorded as delivered.
 
 ## Commands
 
@@ -144,6 +155,19 @@ held and delivered at your next request, bounded to the most recent 100.
     }
 
 `maxAdvisoriesPerTurn` and `vetoBudget` are both capped at 10 however high you set them.
+
+## Trust
+
+Observer definitions are loaded from three places: the bundled `observers/` directory,
+`<agent dir>/observers/`, and the project's own `.pi/observers/`. **The project layer is
+loaded only when the project is trusted.**
+
+A definition is not configuration that this extension renders -- it is an agent that
+runs, on your credentials, at a trigger the file chooses, reading whatever the process
+can read. Precedence keys on the `name` field, so an untrusted project file could
+otherwise replace a shipped observer outright rather than merely adding one. When the
+layer is skipped and `.pi/observers/` exists, `/observers` says so rather than reporting
+an empty install.
 
 `vetoBudget` is per observer **per fingerprint** -- the string the observer uses to
 identify the thing it is objecting to. It is not a bound on its own, because the
