@@ -160,7 +160,12 @@ export function formatObserverStatus(rows: StatusRow[]): string {
       const name = sanitizeRowField(row.name);
       const model = sanitizeRowField(row.model);
       const state = row.disabled
-        ? `disabled after ${row.failures} failure${row.failures === 1 ? "" : "s"}`
+        ? // "after N failures" invites the reader to compare N against the threshold,
+          // which is 3 CONSECUTIVE failures -- so an observer that failed once,
+          // recovered, then failed three times rendered "disabled after 4 failures" and
+          // sent the reader looking for a fourth consecutive failure that never
+          // happened. Say which count this is rather than leaving it to be inferred.
+          `disabled; ${row.failures} failure${row.failures === 1 ? "" : "s"} in total`
         : row.enabled
           ? "on"
           : "off";

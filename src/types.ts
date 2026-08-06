@@ -73,6 +73,15 @@ export interface SliceState {
   lastUserMessage?: string;
   lastAssistantMessage?: string;
   toolCallsThisTurn?: ToolCallRecord[];
+  /**
+   * Tool calls the CALLER dropped before handing the list over, if any.
+   *
+   * src/slices.ts derives `total=` from the array it is given, which is right when the
+   * array is complete and a lie when it is not. src/index.ts bounds this list itself, so
+   * without this the authoritative count on the unforgeable marker line reported what
+   * survived rather than what happened.
+   */
+  toolCallsOmitted?: number;
   transcript?: string;
   skills?: Array<{ name: string; description: string }>;
 }

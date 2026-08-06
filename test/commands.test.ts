@@ -360,9 +360,29 @@ describe("formatObserverStatus — failure gating", () => {
     expect(out).not.toMatch(/0 failures?/);
   });
 
+  it("says which count a disabled observer's failure number is", () => {
+    // The bus disables after 3 CONSECUTIVE failures, but this row carries the TOTAL.
+    // "disabled after 4 failures" therefore invited a reader who knows the threshold to
+    // conclude something that did not happen. The label now says which count it is.
+    const out = formatObserverStatus([
+      {
+        name: "flaky",
+        enabled: true,
+        model: "m",
+        runs: 5,
+        failures: 4,
+        disabled: true,
+        accepted: 0,
+        dropped: 0,
+      },
+    ]);
+    expect(out).toContain("4 failures in total");
+    expect(out).not.toMatch(/after 4 failures/);
+  });
+
   it("does not double-report a disabled observer's failure count", () => {
-    // The count already appears once in the state label ("disabled after 3 failures");
-    // it must not also appear a second time in the trailing parts list.
+    // The count already appears once in the state label; it must not also appear a
+    // second time in the trailing parts list.
     const out = formatObserverStatus([
       {
         name: "flaky",

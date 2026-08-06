@@ -15,6 +15,7 @@ import createExtension, {
   readObserverSettingsBlock,
 } from "../src/index.ts";
 import type { ObserverRunner } from "../src/runner.ts";
+import { renderSlices } from "../src/slices.ts";
 import type { ObserverDefinition, Proposal, SliceState } from "../src/types.ts";
 
 /* ------------------------------------------------------------------ *
@@ -1235,11 +1236,12 @@ describe("delivery", () => {
     expect(names.at(-1)).toBe("read");
   });
 
-  it("says how many tool calls the bound discarded", async () => {
-    // src/slices.ts computes its shown/total from the array it receives, so after
-    // eviction that total describes what survived, not what happened. The gap is
-    // announced in-band instead, and placed first so it survives slices.ts's own
-    // head-and-tail render.
+  it("reports the true tool-call total, not the number that survived the bound", async () => {
+    // The count on the marker line is the one thing content cannot forge, which is
+    // exactly why it must not be wrong. src/slices.ts derives it from the array it is
+    // handed; this extension bounds that array itself, so the caller has to say what it
+    // dropped or the authoritative number understates reality by however much was
+    // discarded -- 2001 calls rendering as total=500.
     const h = harness();
     const seen: SliceState[] = [];
     const d = def({ name: "obs", on: "tool_execution_end", sees: ["tool_calls_this_turn"] });
@@ -1270,14 +1272,25 @@ describe("delivery", () => {
     }
     await tick();
 
-    const calls = seen.at(-1)?.toolCallsThisTurn ?? [];
-    const marker = calls[0];
-    expect(marker?.name).toContain("omitted");
-    // 2000 recorded, 499 head + 500 tail... the exact figure is what matters: it must
-    // account for every discarded call, not just the ones dropped by the last compaction.
-    expect(marker?.args).toBe(
-      `${2000 - (calls.length - 1)} tool call(s) from the middle of this run are not shown`,
-    );
+    const state = seen.at(-1);
+    const retained = state?.toolCallsThisTurn?.length ?? 0;
+    expect(retained).toBe(MAX_TURN_TOOL_CALLS);
+    expect((state?.toolCallsOmitted ?? 0) + retained).toBe(2000);
+
+    // ...and the number that actually reaches the observer says 2000, not 500.
+    const rendered = renderSlices(["tool_calls_this_turn"], state ?? {});
+    expect(rendered).toContain("total=2000");
+    expect(rendered).not.toContain(`total=${MAX_TURN_TOOL_CALLS}`);
+
+    // A /reload must not carry the old run's omissions into the new session's total,
+    // which would make the number wrong in the other direction.
+    await fire(h, "session_start", {}, ctx);
+    await fire(h, "before_agent_start", {}, ctx);
+    await fire(h, "tool_execution_start", { toolCallId: "n", toolName: "read", args: {} }, ctx);
+    await fire(h, "tool_execution_end", { toolCallId: "n", toolName: "read", isError: false }, ctx);
+    await tick();
+    expect(seen.at(-1)?.toolCallsOmitted).toBe(0);
+    expect(renderSlices(["tool_calls_this_turn"], seen.at(-1) ?? {})).toContain("status=present");
   });
 
   it("bounds the tool-call record over a very long agent run", async () => {

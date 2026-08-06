@@ -455,12 +455,19 @@ function collectionContent<T>(
   cap: number,
   emptyNote: Sanitized,
   renderEntry: (entry: T) => Sanitized,
+  // How many entries existed before the CALLER dropped any. Defaults to the array
+  // length, which is correct only when the caller handed over everything it had.
+  // src/index.ts bounds the tool-call record itself, so a total derived here would
+  // describe what survived that bound rather than what happened -- an authoritative
+  // number, on the one line content cannot forge, understating reality by however much
+  // the caller discarded.
+  trueTotal: number = entries.length,
 ): SectionContent {
-  if (entries.length === 0) return { status: "empty", note: emptyNote };
+  if (entries.length === 0 && trueTotal === 0) return { status: "empty", note: emptyNote };
   const shown = headAndTail(entries, cap);
   const body = joinLines(shown.map(renderEntry));
-  if (entries.length > shown.length) {
-    return { status: "truncated", body, shown: shown.length, total: entries.length };
+  if (trueTotal > shown.length) {
+    return { status: "truncated", body, shown: shown.length, total: trueTotal };
   }
   return { status: "present", body };
 }
@@ -480,6 +487,7 @@ function sliceContent(slice: SliceName, state: SliceState): SectionContent {
         ENTRY_LIMITS.toolCalls,
         NO_TOOL_CALLS,
         renderToolCall,
+        state.toolCallsThisTurn.length + (state.toolCallsOmitted ?? 0),
       );
     case "skills":
       if (state.skills === undefined) return { status: "unavailable" };

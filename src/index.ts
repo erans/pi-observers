@@ -258,6 +258,8 @@ export function collectSliceState(opts: {
   sees: SliceName[];
   ctx: unknown;
   turnToolCalls: ToolCallRecord[];
+  /** Tool calls this run dropped before `turnToolCalls`, so `total=` can be true. */
+  toolCallsOmitted?: number;
   commands: Array<{ name: string; description?: string; source: string }>;
 }): SliceState {
   const state: SliceState = {};
@@ -269,6 +271,7 @@ export function collectSliceState(opts: {
   }
   if (opts.sees.includes("tool_calls_this_turn")) {
     state.toolCallsThisTurn = [...opts.turnToolCalls];
+    state.toolCallsOmitted = opts.toolCallsOmitted;
   }
   if (opts.sees.includes("transcript")) {
     state.transcript = transcriptOf(opts.ctx);
@@ -444,15 +447,6 @@ export const MAX_HELD_PROPOSALS = 100;
 
 /** Bound on tool-call records kept for one agent run. */
 export const MAX_TURN_TOOL_CALLS = 500;
-/**
- * Name of the synthetic entry compactToolCalls inserts to announce an elision.
- *
- * Not a security boundary -- a real tool could be called this, and an agent could emit a
- * fake one. The property that matters is that the TAIL cannot be evicted; this only
- * makes the gap legible, since the shown/total counts on the marker line are computed
- * by src/slices.ts from the array it receives and cannot see what was dropped here.
- */
-const ELIDED_TOOL_NAME = "(omitted by pi-observers)";
 
 /** Bound on in-flight tool-call arguments awaiting their tool_execution_end. */
 const MAX_PENDING_TOOL_ARGS = 200;
@@ -602,30 +596,19 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
    * exactly this reason; this layer has to as well, or the flood simply happens here
    * instead.
    *
-   * The elision is announced in-band. src/slices.ts derives its `total=` from the array
-   * length it is handed, so after eviction that number reports what survived rather than
-   * what happened; a synthetic first entry says how many are missing. It is placed
-   * FIRST, not at the join, because slices.ts renders only the first and last 50 entries
-   * of what it receives and a marker in the middle of 500 would never be shown.
+   * How many were discarded is reported through `toolCallsOmitted`, which src/slices.ts
+   * adds to the array length to produce the `total=` on its marker line. That line is
+   * the one thing content cannot forge, which is where a count claiming authority
+   * belongs -- and slices.ts states the same principle for its own cut point: an in-body
+   * gap line would be renderer text that content could imitate.
    */
   function compactToolCalls(): void {
     const head = Math.floor(MAX_TURN_TOOL_CALLS / 2);
-    const tail = MAX_TURN_TOOL_CALLS - head - 1; // one slot for the marker
-    // The previous marker is stripped before measuring, not carried through the head.
-    // Keeping it means every compaction prepends another one, and after enough of them
-    // the accumulated markers push the real head out -- restoring the exact hiding place
-    // this function exists to close. (Observed: the payload survived 1 compaction and
-    // was gone after 1500.)
-    const real = turnToolCalls.filter((call) => call.name !== ELIDED_TOOL_NAME);
-    omittedToolCalls += Math.max(0, real.length - head - tail);
+    const tail = MAX_TURN_TOOL_CALLS - head;
+    omittedToolCalls += Math.max(0, turnToolCalls.length - head - tail);
     turnToolCalls = [
-      {
-        name: ELIDED_TOOL_NAME,
-        args: `${omittedToolCalls} tool call(s) from the middle of this run are not shown`,
-        isError: false,
-      },
-      ...real.slice(0, head),
-      ...real.slice(Math.max(head, real.length - tail)),
+      ...turnToolCalls.slice(0, head),
+      ...turnToolCalls.slice(turnToolCalls.length - tail),
     ];
   }
 
@@ -710,6 +693,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
         sees: entry.def.sees,
         ctx,
         turnToolCalls,
+        toolCallsOmitted: omittedToolCalls,
         commands,
       });
       // Fire-and-forget. Never awaited: an observer must not add latency to a turn.

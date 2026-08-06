@@ -478,6 +478,68 @@ describe("renderSlices: cardinality caps", () => {
     expect(out).not.toContain(`- t${TOOL_CAP / 2}(`);
   });
 
+  describe("toolCallsOmitted: a total the caller drops from cannot be derived here", () => {
+    it("adds what the caller discarded to the rendered total", () => {
+      // src/index.ts bounds the tool-call record before this module ever sees it, so a
+      // total counted from the array describes what survived that bound. An
+      // authoritative-looking number that is wrong, on the one line content cannot
+      // forge, is worse than no number.
+      const calls = Array.from({ length: TOOL_CAP }, (_, i) => ({
+        name: `t${i}`,
+        args: "a",
+        isError: false,
+      }));
+      const out = renderSlices(["tool_calls_this_turn"], {
+        toolCallsThisTurn: calls,
+        toolCallsOmitted: 1500,
+      });
+      expect(out).toContain(`status=truncated shown=${TOOL_CAP} total=${TOOL_CAP + 1500}`);
+    });
+
+    it("marks a slice truncated even when nothing was dropped HERE", () => {
+      // The array fits the cap, so this module drops nothing -- but entries are missing
+      // all the same, and `status=present` would assert a complete record.
+      const calls = Array.from({ length: 3 }, (_, i) => ({
+        name: `t${i}`,
+        args: "a",
+        isError: false,
+      }));
+      const out = renderSlices(["tool_calls_this_turn"], {
+        toolCallsThisTurn: calls,
+        toolCallsOmitted: 97,
+      });
+      expect(out).toContain("status=truncated shown=3 total=100");
+      expect(out).not.toContain("status=present");
+    });
+
+    it("is absent by default, and the total is then the array length", () => {
+      const calls = Array.from({ length: TOOL_CAP + 1 }, (_, i) => ({
+        name: `t${i}`,
+        args: "a",
+        isError: false,
+      }));
+      const out = renderSlices(["tool_calls_this_turn"], { toolCallsThisTurn: calls });
+      expect(out).toContain(`shown=${TOOL_CAP} total=${TOOL_CAP + 1}`);
+    });
+
+    it("does not call an emptied slice empty when the caller dropped everything", () => {
+      // "empty" means the observer was shown a complete and legitimately empty record.
+      const out = renderSlices(["tool_calls_this_turn"], {
+        toolCallsThisTurn: [],
+        toolCallsOmitted: 42,
+      });
+      expect(out).toContain("status=truncated shown=0 total=42");
+    });
+
+    it("still reports a genuinely empty slice as empty", () => {
+      const out = renderSlices(["tool_calls_this_turn"], {
+        toolCallsThisTurn: [],
+        toolCallsOmitted: 0,
+      });
+      expect(out).toContain("status=empty");
+    });
+  });
+
   it("bounds the document for a hostile number of oversized tool calls", () => {
     // The round-2 attack: 2000 tool calls at 5000 code points of args produced a
     // 10,024,922 character document.
