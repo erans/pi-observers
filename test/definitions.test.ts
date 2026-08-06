@@ -92,4 +92,125 @@ Body.
     const src = `---\nname: n\ndescription: d\non: turn_end\ntimeout_ms: 0\n---\nb`;
     expect(() => parse(src)).toThrow(/timeout_ms/);
   });
+
+  it("rejects malformed YAML (duplicate keys)", () => {
+    const src = `---\nname: n\nname: m\ndescription: d\non: turn_end\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("frontmatter");
+      expect((e as ObserverDefinitionError).file).toBe("/o/goal-tracker.md");
+    }
+  });
+
+  it("rejects non-string/non-array tools field", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\ntools: {read: true}\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("tools");
+    }
+  });
+
+  it("rejects numeric tools field", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\ntools: 123\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("tools");
+    }
+  });
+
+  it("rejects non-string/non-array sees field", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\nsees: {last_user_message: true}\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("sees");
+    }
+  });
+
+  it("rejects non-string/non-array can field", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\ncan: true\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("can");
+    }
+  });
+
+  it("rejects non-string model field (number)", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\nmodel: 123\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("model");
+    }
+  });
+
+  it("rejects non-string model field (object)", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\nmodel: {provider: openai}\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("model");
+    }
+  });
+
+  it("rejects non-boolean enabled field (string)", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\nenabled: nope\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("enabled");
+    }
+  });
+
+  it("rejects non-boolean enabled field (number)", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\nenabled: 1\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("enabled");
+    }
+  });
+
+  it("accepts enabled: true", () => {
+    const d = parse(`---\nname: n\ndescription: d\non: turn_end\nenabled: true\n---\nb`);
+    expect(d.enabled).toBe(true);
+  });
+
+  it("accepts enabled: false", () => {
+    const d = parse(`---\nname: n\ndescription: d\non: turn_end\nenabled: false\n---\nb`);
+    expect(d.enabled).toBe(false);
+  });
+
+  it('accepts enabled: "true" (string)', () => {
+    const d = parse(`---\nname: n\ndescription: d\non: turn_end\nenabled: "true"\n---\nb`);
+    expect(d.enabled).toBe(true);
+  });
+
+  it('accepts enabled: "false" (string)', () => {
+    const d = parse(`---\nname: n\ndescription: d\non: turn_end\nenabled: "false"\n---\nb`);
+    expect(d.enabled).toBe(false);
+  });
+
+  it("rejects non-string/non-array fallback field", () => {
+    const src = `---\nname: n\ndescription: d\non: turn_end\nfallback: {model: openai}\n---\nb`;
+    expect(() => parse(src)).toThrow(ObserverDefinitionError);
+    try {
+      parse(src);
+    } catch (e) {
+      expect((e as ObserverDefinitionError).field).toBe("fallback");
+    }
+  });
 });

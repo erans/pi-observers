@@ -61,8 +61,13 @@ function fail(file: string, field: string | undefined, message: string): never {
   throw new ObserverDefinitionError(message, file, field);
 }
 
-/** Frontmatter list fields accept a YAML list or a comma-separated string. */
-function asList(value: unknown): string[] | undefined {
+/**
+ * Frontmatter list fields accept a YAML list or a comma-separated string.
+ * Returns undefined only if the value is absent (undefined or null).
+ * Returns an array if the value is present and valid (array or string).
+ * Returns "invalid" if the value is present but of wrong type (object, number, boolean, etc.).
+ */
+function asList(value: unknown): string[] | "invalid" | undefined {
   if (value === undefined || value === null) return undefined;
   if (Array.isArray(value)) return value.map((v) => String(v).trim()).filter(Boolean);
   if (typeof value === "string") {
@@ -71,7 +76,8 @@ function asList(value: unknown): string[] | undefined {
       .map((v) => v.trim())
       .filter(Boolean);
   }
-  return undefined;
+  // Present but wrong type (object, number, boolean, etc.)
+  return "invalid";
 }
 
 function requireString(raw: Raw, key: string, file: string): string {
@@ -109,6 +115,9 @@ function manyOf<T extends string>(
   fallbackValue: T[],
 ): T[] {
   const list = asList(raw[key]);
+  if (list === "invalid") {
+    fail(file, key, `"${key}" must be a list or comma-separated string, got ${typeof raw[key]}.`);
+  }
   if (list === undefined) return fallbackValue;
   for (const item of list) {
     if (!(allowed as readonly string[]).includes(item)) {
@@ -128,26 +137,57 @@ function positiveInt(raw: Raw, key: string, file: string, fallbackValue: number)
   return num;
 }
 
+function parseEnabled(raw: Raw, file: string): boolean {
+  const value = raw.enabled;
+  if (value === undefined || value === null) return DEFAULTS.enabled;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+  }
+  fail(file, "enabled", `"enabled" must be a boolean or the string "true"/"false", got ${typeof value}.`);
+}
+
+function parseModel(raw: Raw, file: string): string | undefined {
+  const modelRaw = raw.model;
+  if (modelRaw === undefined || modelRaw === null) return undefined;
+  if (typeof modelRaw === "string" && modelRaw.trim() !== "") {
+    return modelRaw.trim();
+  }
+  if (typeof modelRaw === "string" && modelRaw.trim() === "") {
+    return undefined;
+  }
+  fail(file, "model", `"model" must be a string, got ${typeof modelRaw}.`);
+}
+
 export function parseObserverDefinition(
   content: string,
   sourcePath: string,
   scope: ObserverScope,
 ): ObserverDefinition {
-  const { frontmatter, body } = parseFrontmatter<Raw>(content);
-  const raw = frontmatter ?? {};
+  let frontmatter: Raw;
+  let body: string | undefined;
+  try {
+    const result = parseFrontmatter<Raw>(content);
+    frontmatter = result.frontmatter ?? {};
+    body = result.body;
+  } catch (err) {
+    const yamlError = err instanceof Error ? err.message : String(err);
+    fail(sourcePath, "frontmatter", `Invalid YAML in frontmatter: ${yamlError}`);
+  }
 
   // A typo'd field that silently does nothing is worse than a startup complaint.
-  for (const key of Object.keys(raw)) {
+  for (const key of Object.keys(frontmatter)) {
     if (!KNOWN_FIELDS.has(key)) {
       fail(sourcePath, key, `Unknown field "${key}" in observer definition.`);
     }
   }
 
-  const name = requireString(raw, "name", sourcePath);
-  const description = requireString(raw, "description", sourcePath);
-  const on = oneOf<TriggerEvent>(raw, "on", TRIGGER_EVENTS, sourcePath);
+  const name = requireString(frontmatter, "name", sourcePath);
+  const description = requireString(frontmatter, "description", sourcePath);
+  const on = oneOf<TriggerEvent>(frontmatter, "on", TRIGGER_EVENTS, sourcePath);
 
-  const tools = manyOf<string>(raw, "tools", [...ALLOWED_TOOLS, "write", "edit", "bash"], sourcePath, []);
+  const tools = manyOf<string>(frontmatter, "tools", [...ALLOWED_TOOLS, "write", "edit", "bash"], sourcePath, []);
   for (const tool of tools) {
     if (!isAllowedTool(tool)) {
       fail(
@@ -164,31 +204,36 @@ export function parseObserverDefinition(
   }
 
   const thinking = oneOf<ThinkingLevel>(
-    raw,
+    frontmatter,
     "thinking",
     THINKING_LEVELS as readonly ThinkingLevel[],
     sourcePath,
     DEFAULTS.thinking,
   );
 
-  const modelRaw = raw.model;
-  const model = typeof modelRaw === "string" && modelRaw.trim() !== "" ? modelRaw.trim() : undefined;
+  const model = parseModel(frontmatter, sourcePath);
+
+  const fallback = asList(frontmatter.fallback);
+  if (fallback === "invalid") {
+    fail(sourcePath, "fallback", `"fallback" must be a list or comma-separated string, got ${typeof frontmatter.fallback}.`);
+  }
+  const fallbackList = fallback ?? [];
 
   return {
     name,
     description,
-    enabled: raw.enabled === undefined ? DEFAULTS.enabled : Boolean(raw.enabled),
+    enabled: parseEnabled(frontmatter, sourcePath),
     on,
-    sees: manyOf<SliceName>(raw, "sees", SLICE_NAMES, sourcePath, []),
+    sees: manyOf<SliceName>(frontmatter, "sees", SLICE_NAMES, sourcePath, []),
     tools: tools as AllowedTool[],
-    can: manyOf<Capability>(raw, "can", CAPABILITIES, sourcePath, ["advise"]),
-    deliver: oneOf<DeliveryPoint>(raw, "deliver", DELIVERY_POINTS, sourcePath, DEFAULTS.deliver),
+    can: manyOf<Capability>(frontmatter, "can", CAPABILITIES, sourcePath, ["advise"]),
+    deliver: oneOf<DeliveryPoint>(frontmatter, "deliver", DELIVERY_POINTS, sourcePath, DEFAULTS.deliver),
     model,
-    fallback: asList(raw.fallback) ?? [],
+    fallback: fallbackList,
     thinking,
-    priority: positiveInt(raw, "priority", sourcePath, DEFAULTS.priority),
-    maxAdvisoryChars: positiveInt(raw, "max_advisory_chars", sourcePath, DEFAULTS.maxAdvisoryChars),
-    timeoutMs: positiveInt(raw, "timeout_ms", sourcePath, DEFAULTS.timeoutMs),
+    priority: positiveInt(frontmatter, "priority", sourcePath, DEFAULTS.priority),
+    maxAdvisoryChars: positiveInt(frontmatter, "max_advisory_chars", sourcePath, DEFAULTS.maxAdvisoryChars),
+    timeoutMs: positiveInt(frontmatter, "timeout_ms", sourcePath, DEFAULTS.timeoutMs),
     systemPrompt,
     sourcePath,
     scope,
