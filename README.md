@@ -38,8 +38,8 @@ bundled.
     tools: [read, grep]             # read-only only: read, grep, find, ls
     can: [advise]                   # advise, veto
     deliver: next_prompt            # next_prompt | next_turn | settle
-    model: lunaroute/deepseek-v4-flash
-    fallback: [anthropic/claude-haiku-4-5]
+    model: anthropic/claude-haiku-4-5
+    fallback: [openai-codex/gpt-5.5]
     priority: 50
     ---
     Your system prompt. Call `propose` once, or nothing at all.
@@ -108,6 +108,12 @@ is the only trigger that sees the right request -- and that handler is also wher
 `next_prompt` is drained. Its suggestion therefore lands on your **next** request
 rather than the current one.
 
+At that trigger the request has not been recorded in the session yet, so
+`last_user_message` is taken from the event rather than looked up. Reading the session
+there returns the *previous* request, or nothing at all on the first request of a
+session -- which is what `skill-recall` was actually being handed until this was fixed:
+an empty slice, and a prompt asking it to choose a skill with no request in hand.
+
 This is a consequence of the non-blocking design, not an oversight. Serving the current
 request would mean holding it open while a second model call finished, which is latency
 on every request to catch the minority that need a skill. If you want that trade, the
@@ -149,7 +155,7 @@ same point again -- it is not silently recorded as delivered.
         "enabled": true,
         "maxAdvisoriesPerTurn": 2,
         "vetoBudget": 3,
-        "defaultModel": "lunaroute/deepseek-v4-flash",
+        "defaultModel": "anthropic/claude-haiku-4-5",
         "disable": ["verification"]
       }
     }

@@ -261,10 +261,33 @@ export function collectSliceState(opts: {
   /** Tool calls this run dropped before `turnToolCalls`, so `total=` can be true. */
   toolCallsOmitted?: number;
   commands: Array<{ name: string; description?: string; source: string }>;
+  /**
+   * The request that is ABOUT to run, from `before_agent_start`'s event.
+   *
+   * At that trigger the incoming prompt is not in the session yet, so
+   * `textOfLast(ctx, "user")` returns the PREVIOUS request -- or nothing at all on the
+   * first request of a session. Observed live: `skill-recall`, whose entire job is to
+   * suggest a skill for the request about to run, was rendered
+   * `section=last_user_message status=unavailable` and asked to choose a skill with no
+   * request in hand.
+   *
+   * When set, this wins over the session lookup: it IS the last user message, it is just
+   * not recorded yet. Every other trigger fires after the request lands, so they pass
+   * nothing and keep reading the session.
+   *
+   * This does not change WHEN `skill-recall` is delivered. `before_agent_start` drains
+   * `next_prompt` in the same handler that starts the run, so its advice still lands on
+   * the following request -- see the known limitation in README.md. It changes which
+   * request the advice is ABOUT, from the wrong one to the right one.
+   */
+  pendingUserMessage?: string;
 }): SliceState {
   const state: SliceState = {};
   if (opts.sees.includes("last_user_message")) {
-    state.lastUserMessage = textOfLast(opts.ctx, "user");
+    state.lastUserMessage =
+      opts.pendingUserMessage !== undefined && opts.pendingUserMessage !== ""
+        ? opts.pendingUserMessage
+        : textOfLast(opts.ctx, "user");
   }
   if (opts.sees.includes("last_assistant_message")) {
     state.lastAssistantMessage = textOfLast(opts.ctx, "assistant");
@@ -709,7 +732,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     }
   }
 
-  function kickAll(trigger: TriggerEvent, ctx: unknown): void {
+  function kickAll(trigger: TriggerEvent, ctx: unknown, pendingUserMessage?: string): void {
     const due = activeFor(trigger);
     if (due.length === 0) return;
     const commands = due.some((l) => l.def.sees.includes("skills")) ? safeCommands() : [];
@@ -720,6 +743,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
         turnToolCalls,
         toolCallsOmitted: omittedToolCalls,
         commands,
+        pendingUserMessage,
       });
       // Fire-and-forget. Never awaited: an observer must not add latency to a turn.
       const runner = entry.runner;
@@ -920,7 +944,7 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     kickAll("turn_end", ctx);
   });
 
-  pi.on("before_agent_start", async (_event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     // Start of an AGENT RUN, which is what `tool_calls_this_turn` has to mean.
     //
     // pi's `turn` is one LLM round-trip: turn_start -> assistant message -> tool
@@ -952,7 +976,11 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     // observer that 1500 tool calls happened in a run that made none.
     omittedToolCalls = 0;
     pendingToolArgs.clear();
-    kickAll("before_agent_start", ctx);
+    // event.prompt is the request about to run. It is not in the session yet, so an
+    // observer triggered here that reads `last_user_message` would otherwise be handed
+    // the PREVIOUS request, or nothing at all on the first request of a session. See
+    // collectSliceState's `pendingUserMessage`.
+    kickAll("before_agent_start", ctx, event.prompt);
     const advisories = drainFor("next_prompt");
     if (advisories.length === 0) return;
     recordDelivered(advisories);
