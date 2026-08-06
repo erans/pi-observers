@@ -2,7 +2,7 @@
 name: goal-tracker
 description: Hold the agent to a declared goal until the work is actually done
 enabled: true
-on: agent_settled
+on: turn_end
 sees: [last_user_message, transcript]
 tools: [read]
 can: [advise, veto]

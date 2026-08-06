@@ -51,11 +51,49 @@ Other frontmatter fields, all optional: `enabled` (default `true`), `thinking`
 Observers cannot write. Anything an observer needs beyond its `sees:` slices, it
 fetches with `read`/`grep`.
 
+### Choosing `on:` and `deliver:`
+
+Observers never block a turn. A run started by a lifecycle event resolves after that
+event's handler has already returned, so **an observer whose `on:` trigger is the same
+event that drains its `deliver:` point is always one occurrence late** -- and in a
+session with only one such occurrence, it is never delivered at all.
+
+Two triggers drain a delivery point in the same handler that starts the run:
+
+| `on:` | drains |
+|---|---|
+| `before_agent_start` | `next_prompt` |
+| `agent_settled` | `settle` |
+
+So pick a trigger *earlier* than your delivery point. `on: turn_end` with
+`deliver: settle` is the reliable pairing for anything judging finished work: an agent
+run doing real work has several turns before it settles, which is the room the observer
+needs to finish. A `can: [veto]` observer must never trigger on its own delivery point
+-- a late veto reopens the turn after the one whose work it judged.
+
+`tool_calls_this_turn` accumulates over a whole agent run (your request through the
+agent's final answer), not one model round-trip, so an observer reading it at
+`turn_end` sees everything the agent has done so far in that run.
+
+#### Known limitation: `skill-recall` advises the next request
+
+`skill-recall` is the one bundled observer that cannot follow the rule above. Its job
+is to suggest a skill for the request that is *about to* run, so `before_agent_start`
+is the only trigger that sees the right request -- and that handler is also where
+`next_prompt` is drained. Its suggestion therefore lands on your **next** request
+rather than the current one.
+
+This is a consequence of the non-blocking design, not an oversight. Serving the current
+request would mean holding it open while a second model call finished, which is latency
+on every request to catch the minority that need a skill. If you want that trade, the
+change is a bounded await in the `before_agent_start` handler; nothing in the observer
+format needs to change.
+
 ## Commands
 
 | Command | Effect |
 |---|---|
-| `/observers` | Status: resolved model, runs, failures |
+| `/observers` | Status: resolved model, runs, failures, accepted/dropped counts, and why any observer is silent |
 | `/observers enable\|disable <name>` | Toggle for this session |
 | `/goal <text>` | Declare the goal `goal-tracker` enforces (empty clears) |
 | `/remember <text>` | Write a note to `.pi/memory/` |

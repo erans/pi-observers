@@ -2,7 +2,7 @@
 name: verification
 description: Check that the agent ran the work it claims it finished
 enabled: false
-on: agent_settled
+on: turn_end
 sees: [last_assistant_message, tool_calls_this_turn]
 tools: [read]
 can: [advise]

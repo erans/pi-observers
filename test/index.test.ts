@@ -638,9 +638,12 @@ describe("delivery", () => {
     expect(h.sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
   });
 
-  it("clears the tool-call list between turns", async () => {
-    // tool_calls_this_turn means this turn. Carrying the previous turn's calls in makes
-    // the verification observer reason about work the agent already finished.
+  it("accumulates tool calls across a whole agent run, not one LLM round-trip", async () => {
+    // pi's `turn` is one LLM round-trip, and tools execute INSIDE the turn that ends
+    // (verified in pi-agent-core's agent-loop.js). The round-trip carrying the agent's
+    // final claim is by definition the one that called no tools, so a per-turn_start
+    // reset handed the verification observer an empty tool record at exactly the moment
+    // its whole job depends on having one.
     const h = harness();
     const seen: SliceState[] = [];
     const d = def({ name: "obs", on: "tool_execution_end", sees: ["tool_calls_this_turn"] });
@@ -654,26 +657,114 @@ describe("delivery", () => {
     };
     const { ctx } = await bootWith(h, [d], { obs: runner });
 
+    const call = async (id: string, name: string) => {
+      await fire(h, "tool_execution_start", { toolCallId: id, toolName: name, args: {} }, ctx);
+      await fire(h, "tool_execution_end", { toolCallId: id, toolName: name, isError: false }, ctx);
+    };
+
+    // One agent run, two LLM round-trips, one tool in each.
+    await fire(h, "before_agent_start", {}, ctx);
     await fire(h, "turn_start", {}, ctx);
-    await fire(h, "tool_execution_start", { toolCallId: "a", toolName: "old_tool", args: {} }, ctx);
-    await fire(
-      h,
-      "tool_execution_end",
-      { toolCallId: "a", toolName: "old_tool", isError: false },
-      ctx,
-    );
+    await call("a", "first_tool");
     await fire(h, "turn_start", {}, ctx);
-    await fire(h, "tool_execution_start", { toolCallId: "b", toolName: "new_tool", args: {} }, ctx);
-    await fire(
-      h,
-      "tool_execution_end",
-      { toolCallId: "b", toolName: "new_tool", isError: false },
-      ctx,
-    );
+    await call("b", "second_tool");
+    await tick();
+    expect(seen.at(-1)?.toolCallsThisTurn?.map((c) => c.name)).toEqual([
+      "first_tool",
+      "second_tool",
+    ]);
+
+    // The next agent run starts clean.
+    await fire(h, "before_agent_start", {}, ctx);
+    await fire(h, "turn_start", {}, ctx);
+    await call("c", "next_run_tool");
+    await tick();
+    expect(seen.at(-1)?.toolCallsThisTurn?.map((c) => c.name)).toEqual(["next_run_tool"]);
+  });
+
+  it("bounds the tool-call record over a very long agent run", async () => {
+    // The list now spans a whole agent run rather than one round-trip, so it needs its
+    // own bound; src/slices.ts caps what it RENDERS, not what is retained here.
+    const h = harness();
+    const seen: SliceState[] = [];
+    const d = def({ name: "obs", on: "tool_execution_end", sees: ["tool_calls_this_turn"] });
+    const runner: ObserverRunner = {
+      name: "obs",
+      async run(state) {
+        seen.push(state);
+        return null;
+      },
+      dispose() {},
+    };
+    const { ctx } = await bootWith(h, [d], { obs: runner });
+
+    await fire(h, "before_agent_start", {}, ctx);
+    await fire(h, "turn_start", {}, ctx);
+    for (let i = 0; i < 600; i++) {
+      await fire(
+        h,
+        "tool_execution_start",
+        { toolCallId: `t${i}`, toolName: `tool${i}`, args: {} },
+        ctx,
+      );
+      await fire(
+        h,
+        "tool_execution_end",
+        { toolCallId: `t${i}`, toolName: `tool${i}`, isError: false },
+        ctx,
+      );
+    }
     await tick();
 
-    const names = seen.at(-1)?.toolCallsThisTurn?.map((c) => c.name) ?? [];
-    expect(names).toEqual(["new_tool"]);
+    const calls = seen.at(-1)?.toolCallsThisTurn ?? [];
+    expect(calls.length).toBeLessThanOrEqual(500);
+    // Oldest dropped first, so the most recent work always survives.
+    expect(calls.at(-1)?.name).toBe("tool599");
+  });
+
+  it("spends one veto budget unit however many times the observer ran", async () => {
+    // goal-tracker now triggers on turn_end, which fires once per LLM round-trip, so a
+    // single agent run can queue several identical vetoes. The prompt asks the model to
+    // reuse the goal text as its fingerprint, but that is an unenforceable instruction.
+    // The property that actually holds is the reconciler's: at most one veto is accepted
+    // per drain, and only that one spends budget. It does not depend on the model
+    // cooperating.
+    const h = harness();
+    const d = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" });
+    const veto = p("goal", "the goal is not met", {
+      kind: "veto",
+      deliver: "settle",
+      fingerprint: "the-goal",
+    });
+    const { ctx } = await bootWith(h, [d], { goal: emitting("goal", veto) });
+
+    for (let roundTrip = 0; roundTrip < 4; roundTrip++) {
+      await fire(h, "turn_end", {}, ctx);
+      await tick();
+    }
+    await fire(h, "agent_settled", {}, ctx);
+
+    expect(h.sent).toHaveLength(1);
+    expect(h.entries.filter((e) => e.customType === "observers-veto-spend")).toHaveLength(1);
+  });
+
+  it("delivers a settle veto on the settle of the run that triggered it", async () => {
+    // The point of moving goal-tracker to turn_end: an agent run with tool work has
+    // several turn_ends before it settles, so the run kicked at the first one has
+    // finished by the time settle drains. This is the case option (a) was chosen to fix.
+    const h = harness();
+    const d = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" });
+    const veto = p("goal", "tests were never run", { kind: "veto", deliver: "settle" });
+    const { ctx } = await bootWith(h, [d], { goal: slow("goal", veto) });
+
+    await fire(h, "before_agent_start", {}, ctx);
+    await fire(h, "turn_end", {}, ctx); // round-trip 1 kicks the observer
+    await tick(); // round-trip 2's tool work happens here
+    await fire(h, "turn_end", {}, ctx); // round-trip 2 carries the final claim
+    await fire(h, "agent_settled", {}, ctx);
+
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.message.customType).toBe("observer-veto");
   });
 
   it("caps a tool-call argument summary", async () => {

@@ -413,6 +413,9 @@ const DEFAULT_DEPS: ObserverDeps = {
  */
 export const MAX_HELD_PROPOSALS = 100;
 
+/** Bound on tool-call records kept for one agent run. */
+const MAX_TURN_TOOL_CALLS = 500;
+
 /** Bound on in-flight tool-call arguments awaiting their tool_execution_end. */
 const MAX_PENDING_TOOL_ARGS = 200;
 
@@ -707,11 +710,6 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     }
   });
 
-  pi.on("turn_start", async () => {
-    turnToolCalls = [];
-    pendingToolArgs.clear();
-  });
-
   pi.on("tool_execution_start", async (event) => {
     if (pendingToolArgs.size >= MAX_PENDING_TOOL_ARGS) return;
     pendingToolArgs.set(event.toolCallId, summarizeArgs(event.args));
@@ -723,6 +721,10 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       args: pendingToolArgs.get(event.toolCallId) ?? "",
       isError: Boolean(event.isError),
     });
+    // The list now spans a whole agent run, so it needs its own bound. src/slices.ts
+    // renders at most 100 entries (head and tail) whatever it is given; this only stops
+    // a very long run from growing the array itself without limit.
+    if (turnToolCalls.length > MAX_TURN_TOOL_CALLS) turnToolCalls.shift();
     pendingToolArgs.delete(event.toolCallId);
     kickAll("tool_execution_end", ctx);
   });
@@ -732,6 +734,19 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
+    // Start of an AGENT RUN, which is what `tool_calls_this_turn` has to mean.
+    //
+    // pi's `turn` is one LLM round-trip: turn_start -> assistant message -> tool
+    // executions -> turn_end (verified in pi-agent-core's agent-loop.js -- tools run
+    // INSIDE the turn that ends). A single user request is many such turns. Resetting
+    // per turn_start therefore left the slice holding only the last round-trip's tools,
+    // and the round-trip that carries the agent's final claim is by definition the one
+    // that called no tools -- so the verification observer, whose entire job is
+    // checking claims against the tool record, was handed an empty record at exactly
+    // the moment it mattered. Accumulating across the run is what the slice name means
+    // to a user and what every observer prompt assumes.
+    turnToolCalls = [];
+    pendingToolArgs.clear();
     kickAll("before_agent_start", ctx);
     const advisories = drainFor("next_prompt");
     if (advisories.length === 0) return;
