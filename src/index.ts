@@ -462,35 +462,46 @@ const DEFAULT_DEPS: ObserverDeps = {
 };
 
 /**
- * Where a proposal is ACTUALLY drained, which for a veto is never what it declared.
+ * How an accepted proposal is handed to pi at the moment it arrives.
  *
- * Holding a turn open is only meaningful at `settle`, so a veto is settled there
- * whatever its definition says. The rule used to be written as a disjunction --
- * `deliver === point || (kind === "veto" && point === "settle")` -- and the first clause
- * matched too: a `deliver: next_prompt` veto was ALSO consumed at `before_agent_start`,
- * where it spent budget, was tallied, and was then dropped on the floor, because that
- * handler renders advisories only. Its effect appeared one turn later, reopening a turn
- * whose work it had never seen. The comment above the disjunction asserted this could
- * not happen.
+ * Delivery is arrival-driven: there are no drain points. pi's own message queues carry
+ * the timing guarantees (verified against pi 0.84.0, core/agent-session.js
+ * `_runAgentPrompt`/`sendCustomMessage` and pi-agent-core's agent-loop.js):
  *
- * Exported because test/bundled.test.ts once had its own hand-written copy of this rule
- * for checking definitions. A copy cannot disagree with itself, so when the copy and the
- * implementation diverged the test agreed with the copy. It calls this now.
+ *   - "steer": queued while streaming and injected before the NEXT LLM call of the
+ *     current run; appended straight to the session when idle. The soonest a message
+ *     can reach the model without interrupting anything.
+ *   - "followUp": delivered once the agent has no more tool calls. A run cannot settle
+ *     past a queued follow-up -- pi continues the loop while `hasQueuedMessages()` --
+ *     so a proposal formed mid-run joins the run it is about, instead of racing it.
+ *
+ * An advisory rides "steer" unless its definition said `deliver: settle`, which maps to
+ * "followUp": commentary on finished work should arrive after the work, not in the
+ * middle of it. `next_prompt` and `next_turn` both map to "steer" -- the distinction
+ * between them was an artifact of the drain points and has no arrival-driven analogue.
+ *
+ * A veto is always a turn-triggering follow-up, whatever its `deliver:` says -- the
+ * same override the drain model applied, for the same reason: holding work open is only
+ * meaningful at its end, and `triggerTurn` is what reopens an already-idle session.
+ * While the run is still active, `triggerTurn` is ignored by pi and the follow-up
+ * queue's settle guarantee is what holds the run open.
  */
-export function effectiveDeliveryPoint(proposal: {
-  kind: Proposal["kind"];
-  deliver: DeliveryPoint;
-}): DeliveryPoint {
-  return proposal.kind === "veto" ? "settle" : proposal.deliver;
+export function deliveryOptions(proposal: { kind: Proposal["kind"]; deliver: DeliveryPoint }): {
+  deliverAs: "steer" | "followUp";
+  triggerTurn?: true;
+} {
+  if (proposal.kind === "veto") return { deliverAs: "followUp", triggerTurn: true };
+  return proposal.deliver === "settle" ? { deliverAs: "followUp" } : { deliverAs: "steer" };
 }
 
 /**
- * Bound on proposals held for a delivery point that has not arrived yet.
+ * Bound on advisories deferred for a later flush.
  *
- * A proposal drained at the wrong delivery point is put back, not dropped. Without a
- * bound, an observer whose `deliver` point never fires in a given session would grow
- * this list for the life of the session. Oldest is discarded first: advice about a turn
- * twenty turns ago is the least useful thing here.
+ * An advisory is deferred rather than delivered in exactly two cases: a veto took the
+ * stage in its flush, or the delivery window was already at `maxAdvisoriesPerTurn`.
+ * Without a bound, a veto storm or a chatty observer fleet would grow this list for the
+ * life of the session. Oldest is discarded first: advice about a turn twenty turns ago
+ * is the least useful thing here.
  */
 export const MAX_HELD_PROPOSALS = 100;
 
@@ -523,7 +534,7 @@ function summarizeArgs(args: unknown): string {
 export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   let settings: ObserverSettings = parseSettings(undefined);
   let reconciler = new Reconciler();
-  let bus = new ProposalBus();
+  let bus = new ProposalBus({ onProposal: scheduleFlush });
   let loaded: Loaded[] = [];
   let turnToolCalls: ToolCallRecord[] = [];
   /**
@@ -557,19 +568,55 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
    *  observer reasons over -- would carry no information at all. */
   const pendingToolArgs = new Map<string, string>();
 
-  const held: Proposal[] = [];
   /**
-   * Advisories drained at a settle that a veto pre-empted, waiting for the next settle.
+   * Advisories accepted by the reconciler but not yet delivered, waiting for a later
+   * flush.
    *
-   * NOT `held`. A held proposal goes back through reconciler.reconcile() on the next
-   * drain, and these have already been through it: their fingerprints are in the
-   * accepted set and their entries are already appended, so re-holding them means the
-   * next drain discards them as "already delivered earlier in this session". The fix
-   * that looks obvious is a no-op, which is why this list is separate and why a test
-   * asserts delivery at the NEXT settle rather than merely asserting they were kept.
+   * Two ways in: a veto took the stage in their flush, or the delivery window was
+   * already full. Their fingerprints are in the accepted set and cannot go back through
+   * reconcile() -- a re-submission would be discarded as "already delivered earlier in
+   * this session" -- so they are re-queued as-is and eviction must forget() them.
    */
-  const deferredSettleAdvisories: Proposal[] = [];
-  let pendingVeto: Proposal | null = null;
+  const deferredAdvisories: Proposal[] = [];
+  /**
+   * Advisories delivered since the window last reset.
+   *
+   * The reconciler caps each BATCH at `maxAdvisoriesPerTurn`; arrival-driven flushes
+   * make batches small and frequent, so without this counter a busy fleet could send
+   * `maxAdvisoriesPerTurn` advisories per FLUSH, several times a turn. The window
+   * resets where a turn boundary is visible from here: `before_agent_start` and
+   * `agent_settled`.
+   */
+  let advisoriesThisWindow = 0;
+  /**
+   * Whether a veto has been delivered since the window last reset.
+   *
+   * The reconciler's one-veto rule is per BATCH, and arrival-driven flushes make
+   * batches small: a goal observer re-vetoing on every round-trip of one run would
+   * deliver `vetoBudget` redundant vetoes back to back. At most one veto is delivered
+   * per window; the rest are dropped BEFORE reconcile, so they spend no budget --
+   * the goal being still unmet at the next window is what re-raises them.
+   */
+  let vetoThisWindow = false;
+  /**
+   * The pending micro-batch flush, if one is scheduled.
+   *
+   * One timer, set on the first arrival and cleared when it fires: proposals landing in
+   * the same tick reconcile as one batch, so `priority` still means something when two
+   * observers kicked by the same event finish together. Scattered arrivals each get
+   * their own flush -- with live models, runs land seconds apart and batching almost
+   * never triggers, which is fine: the point of arrival-driven delivery is promptness,
+   * not batching.
+   */
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * True between session_shutdown and the next session_start.
+   *
+   * An observer run can outlive shutdown -- abortAll() only signals; a run that ignores
+   * its signal still resolves -- and its arrival callback would otherwise schedule a
+   * flush that sends into a session pi is tearing down.
+   */
+  let stopped = false;
 
   /** Per-observer accepted/dropped counts for the /observers command. */
   interface Tally {
@@ -692,36 +739,19 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     tally.lastDropReason = reason;
   }
 
-  function requeue(proposal: Proposal): void {
-    held.push(proposal);
-    // An eviction here is a proposal that will never be delivered. It has not been
-    // reconciled yet, so nothing has been tallied or written for it -- but silence would
-    // still leave /observers reporting an observer as healthy while its output vanished.
-    if (held.length > MAX_HELD_PROPOSALS) {
-      const evicted = held.shift();
-      if (evicted) {
-        noteDrop(
-          evicted,
-          `waiting for delivery at "${evicted.deliver}", evicted by the ${MAX_HELD_PROPOSALS}-proposal hold bound`,
-        );
-      }
-    }
-  }
-
-  /** Same bound as `held`: a deferral must not become an unbounded accumulation path. */
-  function deferSettleAdvisories(advisories: Proposal[]): void {
+  /** Same eviction contract as the old settle deferral: these HAVE been through
+   *  reconcile(), so an eviction must undo both records that say they were accepted --
+   *  the tally, and the reconciler's dedupe set. Leaving the latter alone means the
+   *  observer can never raise this point again for the whole session. */
+  function deferAdvisories(advisories: Proposal[]): void {
     for (const advisory of advisories) {
-      deferredSettleAdvisories.push(advisory);
-      if (deferredSettleAdvisories.length > MAX_HELD_PROPOSALS) {
-        const evicted = deferredSettleAdvisories.shift();
+      deferredAdvisories.push(advisory);
+      if (deferredAdvisories.length > MAX_HELD_PROPOSALS) {
+        const evicted = deferredAdvisories.shift();
         if (evicted) {
-          // These HAVE been through reconcile(), so two records exist that say the
-          // advisory was accepted and must both be undone: the tally, and the
-          // reconciler's dedupe set. Leaving the latter alone means the observer can
-          // never raise this point again for the whole session.
           noteDrop(
             evicted,
-            `held for delivery at settle, then evicted by the ${MAX_HELD_PROPOSALS}-proposal deferral bound`,
+            `held for a later flush, then evicted by the ${MAX_HELD_PROPOSALS}-proposal deferral bound`,
           );
           reconciler.forget(evicted.fingerprint);
         }
@@ -778,46 +808,91 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     }
   }
 
-  function drainFor(point: DeliveryPoint): Proposal[] {
-    // Held proposals are reconsidered first: a proposal that landed while a different
-    // delivery point was draining was put back, and this is where it gets its turn.
-    // Without this the requeue is a leak, not a deferral.
-    const all = [...held.splice(0, held.length), ...bus.drain()];
+  /** Debounce to the next macrotask, so proposals landing in the same tick are
+   *  reconciled and delivered as one batch. See `flushTimer`. */
+  function scheduleFlush(): void {
+    if (stopped || flushTimer) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      flush();
+    }, 0);
+  }
 
-    const mine: Proposal[] = [];
-    for (const proposal of all) {
-      if (effectiveDeliveryPoint(proposal) === point) {
-        mine.push(proposal);
+  /** Record and hand a batch of accepted advisories to pi, split by delivery mode. */
+  function deliverAdvisories(advisories: Proposal[]): void {
+    if (advisories.length === 0) return;
+    recordDelivered(advisories);
+    advisoriesThisWindow += advisories.length;
+    const steer = advisories.filter((a) => deliveryOptions(a).deliverAs === "steer");
+    const followUp = advisories.filter((a) => deliveryOptions(a).deliverAs === "followUp");
+    if (steer.length > 0) {
+      pi.sendMessage(
+        { customType: "observer-advisory", content: formatAdvisories(steer), display: true },
+        { deliverAs: "steer" },
+      );
+    }
+    if (followUp.length > 0) {
+      pi.sendMessage(
+        { customType: "observer-advisory", content: formatAdvisories(followUp), display: true },
+        { deliverAs: "followUp" },
+      );
+    }
+  }
+
+  /**
+   * Reconcile whatever has landed and deliver it, immediately.
+   *
+   * Called from the arrival debounce and from the two window boundaries
+   * (`before_agent_start`, `agent_settled`), where it also releases the deferred
+   * backlog into the fresh window. Never called from anywhere that would make an
+   * observer's latency the agent's latency: everything here is synchronous
+   * bookkeeping around fire-and-forget sendMessage calls.
+   */
+  function flush(): void {
+    if (stopped) return;
+    // Suppressed vetoes never reach reconcile(), which is what keeps their budget
+    // unspent: reconcile spends at acceptance, and a spent-but-suppressed veto would
+    // burn through the budget with nothing delivered.
+    const batch: Proposal[] = [];
+    for (const proposal of bus.drain()) {
+      if (proposal.kind === "veto" && vetoThisWindow) {
+        noteDrop(proposal, "a veto was already delivered this window");
       } else {
-        requeue(proposal);
+        batch.push(proposal);
       }
     }
+    const { advisories, veto, dropped } = reconciler.reconcile(batch);
+    for (const drop of dropped) noteDrop(drop.proposal, drop.reason);
 
-    const { advisories, veto, dropped } = reconciler.reconcile(mine);
     if (veto) {
-      pendingVeto = veto;
+      vetoThisWindow = true;
       // One entry per accepted veto. session_start counts them back into the spend map
       // it hands to reconciler.restore(), which is what makes the budget survive a
       // /reload -- the reconciler's own counter is in-memory and starts empty.
+      // A veto is tallied here because it is delivered by this same flush, with
+      // nothing between. Advisories are tallied at recordDelivered instead.
+      tallyFor(veto.observer).accepted += 1;
       pi.appendEntry(VETO_SPEND_ENTRY, {
         fingerprint: veto.fingerprint,
         observer: veto.observer,
       });
+      // The veto takes the stage: advisories reconciled in the same flush wait for the
+      // next one, exactly as the settle drain used to defer them behind a veto.
+      deferAdvisories(advisories);
+      pi.sendMessage(
+        { customType: "observer-veto", content: formatVeto(veto), display: true },
+        deliveryOptions(veto),
+      );
+      return;
     }
 
-    // Tally per observer for /observers. The reconciler is stateless about who proposed
-    // what across calls, and the bus only counts runs -- so an observer that runs
-    // constantly and has everything dropped would otherwise look identical to a healthy
-    // one. This is the only place both outcomes are visible.
-    // A veto is tallied here because it is sent by the same handler that drains it,
-    // with nothing between. Advisories are tallied at recordDelivered instead.
-    if (veto) tallyFor(veto.observer).accepted += 1;
-    // ReconcileResult["dropped"] is Array<{ proposal, reason }>, NOT bare proposals.
-    // `d.observer` would compile to undefined and every dropped tally would silently
-    // count zero under a column that still looked plausible.
-    for (const drop of dropped) noteDrop(drop.proposal, drop.reason);
-
-    return advisories;
+    const queued = [...deferredAdvisories.splice(0, deferredAdvisories.length), ...advisories];
+    // The deferral bypassed maxAdvisoriesPerTurn: the reconciler caps each BATCH, and a
+    // backlog is many batches. The window counter is what stops a run of flushes from
+    // dumping the whole backlog at once. Oldest first, surplus stays deferred.
+    const room = Math.max(0, settings.maxAdvisoriesPerTurn - advisoriesThisWindow);
+    deliverAdvisories(queued.slice(0, room));
+    deferAdvisories(queued.slice(room));
   }
 
   function disposeAll(): void {
@@ -841,10 +916,21 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
       maxAdvisoriesPerTurn: settings.maxAdvisoriesPerTurn,
       vetoBudget: settings.vetoBudget,
     });
-    bus = new ProposalBus();
-    held.length = 0;
-    deferredSettleAdvisories.length = 0;
-    pendingVeto = null;
+    // Rebuilt with the arrival callback every session: the callback closes over
+    // nothing session-scoped (scheduleFlush reads the CURRENT bus and reconciler), so
+    // an old bus resolving late can at worst schedule a flush that drains the new,
+    // empty bus.
+    bus = new ProposalBus({ onProposal: scheduleFlush });
+    stopped = false;
+    if (flushTimer) {
+      // A /reload fires session_shutdown first, which clears this -- but do not depend
+      // on it, same as disposeAll above.
+      clearTimeout(flushTimer);
+      flushTimer = undefined;
+    }
+    deferredAdvisories.length = 0;
+    advisoriesThisWindow = 0;
+    vetoThisWindow = false;
     turnToolCalls = [];
     omittedToolCalls = 0;
     pendingToolArgs.clear();
@@ -1002,79 +1088,27 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     // observer that 1500 tool calls happened in a run that made none.
     omittedToolCalls = 0;
     pendingToolArgs.clear();
+    // A window boundary: the advisory budget refreshes with the request, and the
+    // deferred backlog gets its chance in the fresh window. Delivery goes through
+    // sendMessage like every other flush -- pi appends an idle-delivered message to
+    // the session directly, so it reaches this request's very first LLM call.
+    advisoriesThisWindow = 0;
+    vetoThisWindow = false;
     // event.prompt is the request about to run. It is not in the session yet, so an
     // observer triggered here that reads `last_user_message` would otherwise be handed
     // the PREVIOUS request, or nothing at all on the first request of a session. See
     // collectSliceState's `pendingUserMessage`.
     kickAll("before_agent_start", ctx, event.prompt);
-    const advisories = drainFor("next_prompt");
-    if (advisories.length === 0) return;
-    recordDelivered(advisories);
-    return {
-      message: {
-        customType: "observer-advisory",
-        content: formatAdvisories(advisories),
-        display: true,
-      },
-    };
-  });
-
-  pi.on("context", async (event) => {
-    const advisories = drainFor("next_turn");
-    if (advisories.length === 0) return;
-    recordDelivered(advisories);
-    return {
-      messages: [
-        ...event.messages,
-        {
-          role: "user" as const,
-          content: [{ type: "text" as const, text: formatAdvisories(advisories) }],
-          timestamp: Date.now(),
-        },
-      ],
-    };
+    flush();
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     kickAll("agent_settled", ctx);
-    const drained = drainFor("settle");
-
-    if (pendingVeto) {
-      const veto = pendingVeto;
-      pendingVeto = null;
-      // A veto and an advisory can be drained together, and this branch used to return
-      // with `drained` still in scope and nothing holding it -- spliced out of both
-      // `held` and the bus, not re-queued, not logged. Silent destruction of this
-      // extension's primary output, on the one turn the agent is being sent back to
-      // redo work and the advice is most useful. Defer instead.
-      deferSettleAdvisories(drained);
-      pi.sendMessage(
-        {
-          customType: "observer-veto",
-          content: formatVeto(veto),
-          display: true,
-        },
-        { deliverAs: "followUp", triggerTurn: true },
-      );
-      return;
-    }
-
-    const queued = [
-      ...deferredSettleAdvisories.splice(0, deferredSettleAdvisories.length),
-      ...drained,
-    ];
-    // The deferral bypassed maxAdvisoriesPerTurn: the reconciler caps each BATCH, and a
-    // backlog is many batches, so a run of vetoed settles could dump 100 advisories at
-    // once against a configured cap of 2. Oldest first, surplus stays deferred.
-    const advisories = queued.slice(0, settings.maxAdvisoriesPerTurn);
-    deferSettleAdvisories(queued.slice(settings.maxAdvisoriesPerTurn));
-    if (advisories.length > 0) {
-      recordDelivered(advisories);
-      pi.sendMessage(
-        { customType: "observer-advisory", content: formatAdvisories(advisories), display: true },
-        { deliverAs: "followUp" },
-      );
-    }
+    // The other window boundary. Advisories delivered from here on are appended while
+    // idle and land in the NEXT request's context, so they draw on its budget.
+    advisoriesThisWindow = 0;
+    vetoThisWindow = false;
+    flush();
   });
 
   /**
@@ -1091,6 +1125,13 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
    * a fresh one is built at the next session_start.
    */
   pi.on("session_shutdown", async () => {
+    // Before anything else: an abort below can resolve a run on this same tick, and
+    // its arrival callback must find the gate already closed.
+    stopped = true;
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = undefined;
+    }
     bus.abortAll();
     disposeAll();
   });

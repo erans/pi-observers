@@ -326,4 +326,59 @@ describe("ProposalBus", () => {
       vi.useRealTimers();
     }
   });
+
+  describe("onProposal arrival notification", () => {
+    it("notifies after a run lands a proposal, with the proposal already in the queue", async () => {
+      let queuedAtNotify: number | undefined;
+      const bus = new ProposalBus({
+        onProposal: () => {
+          queuedAtNotify = bus.drain().length;
+        },
+      });
+      bus.kick("o", 1000, async () => proposal("a"));
+      await bus.settle();
+      // The callback must fire AFTER the push, so a flush inside it drains the proposal
+      // rather than running early against an empty queue and stranding it.
+      expect(queuedAtNotify).toBe(1);
+    });
+
+    it("does not notify when a run returns null", async () => {
+      const onProposal = vi.fn();
+      const bus = new ProposalBus({ onProposal });
+      bus.kick("o", 1000, async () => null);
+      await bus.settle();
+      expect(onProposal).not.toHaveBeenCalled();
+    });
+
+    it("does not notify when a run fails", async () => {
+      const onProposal = vi.fn();
+      const bus = new ProposalBus({ onProposal });
+      bus.kick("o", 1000, async () => {
+        throw new Error("boom");
+      });
+      await bus.settle();
+      expect(onProposal).not.toHaveBeenCalled();
+    });
+
+    it("keeps its bookkeeping intact when the callback throws", async () => {
+      // The callback runs inside the kick's success path. A throw there must not count
+      // as an observer failure (the run DID succeed), must not leak the in-flight slot,
+      // and must leave the proposal in the queue for the next flush to collect.
+      const bus = new ProposalBus({
+        onProposal: () => {
+          throw new Error("flush broke");
+        },
+      });
+      bus.kick("o", 1000, async () => proposal("a"));
+      await bus.settle();
+      const status = bus.status("o");
+      expect(status.runs).toBe(1);
+      expect(status.failures).toBe(0);
+      expect(bus.drain().map((p) => p.fingerprint)).toEqual(["a"]);
+      // The slot was released: a second kick runs rather than being dropped.
+      bus.kick("o", 1000, async () => proposal("b"));
+      await bus.settle();
+      expect(bus.status("o").runs).toBe(2);
+    });
+  });
 });

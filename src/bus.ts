@@ -26,9 +26,11 @@ export class ProposalBus {
   readonly #queue: Proposal[] = [];
   readonly #entries = new Map<string, Entry>();
   readonly #maxConsecutive: number;
+  readonly #onProposal?: () => void;
 
-  constructor(opts: { maxConsecutiveFailures?: number } = {}) {
+  constructor(opts: { maxConsecutiveFailures?: number; onProposal?: () => void } = {}) {
     this.#maxConsecutive = opts.maxConsecutiveFailures ?? DEFAULTS.maxConsecutiveFailures;
+    this.#onProposal = opts.onProposal;
   }
 
   #entry(name: string): Entry {
@@ -74,7 +76,18 @@ export class ProposalBus {
       .then((proposal) => {
         entry.runs += 1;
         entry.consecutiveFailures = 0;
-        if (proposal) this.#queue.push(proposal);
+        if (proposal) {
+          this.#queue.push(proposal);
+          // After the push, so a flush inside the callback drains this proposal. A
+          // throwing callback must not be charged to the observer as a failed run --
+          // the run itself succeeded -- so it is contained here, not left to the
+          // .catch below, which would also count a failure and burn a strike.
+          try {
+            this.#onProposal?.();
+          } catch {
+            /* the proposal stays queued; the next drain collects it */
+          }
+        }
       })
       .catch((error: unknown) => {
         entry.runs += 1;

@@ -767,103 +767,6 @@ describe("delivery", () => {
     expect(seen).toEqual(["summarise the release notes"]);
   });
 
-  it("delivers a next_prompt advisory as a before_agent_start message", async () => {
-    const h = harness();
-    const d = def({ name: "obs", on: "turn_end", deliver: "next_prompt" });
-    const { ctx } = await bootWith(h, [d], { obs: emitting("obs", p("obs", "check the tests")) });
-
-    await fire(h, "turn_end", {}, ctx);
-    await tick();
-    const result = await fire(h, "before_agent_start", {}, ctx);
-    expect(result?.message?.content).toContain("check the tests");
-    expect(h.entries.filter((e) => e.customType === "observers-accepted")).toHaveLength(1);
-  });
-
-  it("appends a next_turn advisory to the context messages", async () => {
-    const h = harness();
-    const d = def({ name: "obs", on: "turn_end", deliver: "next_turn" });
-    const { ctx } = await bootWith(h, [d], {
-      obs: emitting("obs", p("obs", "watch the budget", { deliver: "next_turn" })),
-    });
-
-    await fire(h, "turn_end", {}, ctx);
-    await tick();
-    const existing = [{ role: "user", content: "hi", timestamp: 1 }];
-    const result = await fire(h, "context", { messages: existing }, ctx);
-    expect(result.messages).toHaveLength(2);
-    expect(JSON.stringify(result.messages.at(-1))).toContain("watch the budget");
-  });
-
-  it("holds a proposal drained at the wrong delivery point and delivers it at its own", async () => {
-    // The requeue is a deferral, not a bin. A settle-scoped proposal that happens to be
-    // in the queue when next_prompt drains must still arrive at settle.
-    const h = harness();
-    const d = def({ name: "obs", on: "turn_end", deliver: "settle" });
-    const { ctx } = await bootWith(h, [d], {
-      obs: emitting("obs", p("obs", "verify before closing", { deliver: "settle" })),
-    });
-
-    await fire(h, "turn_end", {}, ctx);
-    await tick();
-    const early = await fire(h, "before_agent_start", {}, ctx);
-    expect(early).toBeUndefined();
-
-    await fire(h, "agent_settled", {}, ctx);
-    expect(h.sent).toHaveLength(1);
-    expect(h.sent[0]?.message.content).toContain("verify before closing");
-  });
-
-  it("delivers an advisory that a veto pre-empted at the NEXT settle, not never", async () => {
-    // drainFor("settle") SPLICES out of both `held` and the bus. When a veto is also
-    // pending, the handler returned and the drained advisories went out of scope: not
-    // re-held, not re-queued, not logged. Silent destruction of this extension's primary
-    // output, on the one turn the agent is being sent back to redo work.
-    const h = harness();
-    const advisory = p("adv", "the new test file has no assertions", { deliver: "settle" });
-    const veto = p("goal", "the stated goal is not met", { kind: "veto", deliver: "settle" });
-    const { ctx } = await bootWith(
-      h,
-      [
-        def({ name: "adv", on: "turn_end", deliver: "settle" }),
-        def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" }),
-      ],
-      { adv: emitting("adv", advisory), goal: emitting("goal", veto) },
-    );
-
-    await fire(h, "turn_end", {}, ctx);
-    await tick();
-    await fire(h, "agent_settled", {}, ctx);
-    expect(h.sent).toHaveLength(1);
-    expect(h.sent[0]?.message.customType).toBe("observer-veto");
-
-    // The redo finishes and settles again. The advisory must arrive now.
-    await fire(h, "agent_settled", {}, ctx);
-    expect(h.sent).toHaveLength(2);
-    expect(h.sent[1]?.message.customType).toBe("observer-advisory");
-    expect(h.sent[1]?.message.content).toContain("the new test file has no assertions");
-  });
-
-  it("does not redeliver a deferred advisory a second time", async () => {
-    const h = harness();
-    const advisory = p("adv", "deferred once", { deliver: "settle" });
-    const veto = p("goal", "not met", { kind: "veto", deliver: "settle" });
-    const { ctx } = await bootWith(
-      h,
-      [
-        def({ name: "adv", on: "turn_end", deliver: "settle" }),
-        def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" }),
-      ],
-      { adv: emitting("adv", advisory), goal: emitting("goal", veto) },
-    );
-
-    await fire(h, "turn_end", {}, ctx);
-    await tick();
-    await fire(h, "agent_settled", {}, ctx);
-    await fire(h, "agent_settled", {}, ctx);
-    await fire(h, "agent_settled", {}, ctx);
-    expect(h.sent.filter((m) => m.message.customType === "observer-advisory")).toHaveLength(1);
-  });
-
   it("counts an advisory as accepted when it is delivered, not when it is decided", async () => {
     // Acceptance and delivery are different events with two bounds between them.
     // Tallying at acceptance reported "40 runs, 40 accepted, 0 dropped" for an observer
@@ -881,15 +784,14 @@ describe("delivery", () => {
     );
 
     await fire(h, "turn_end", {}, ctx);
-    await tick();
-    await fire(h, "agent_settled", {}, ctx); // veto wins; the advisory is deferred
+    await tick(); // the arrival flush delivers the veto; the advisory is deferred
     await h.commands.get("observers")?.handler("", ctx);
     const beforeDelivery = notices.at(-1)?.message ?? "";
     expect(beforeDelivery).toMatch(/^adv \[on\].*0 accepted/m);
     // ...and no dedupe entry has been written for something nobody has seen.
     expect(h.entries.filter((e) => e.customType === "observers-accepted")).toHaveLength(0);
 
-    await fire(h, "agent_settled", {}, ctx);
+    await fire(h, "agent_settled", {}, ctx); // the settle flush releases the deferral
     await h.commands.get("observers")?.handler("", ctx);
     const afterDelivery = notices.at(-1)?.message ?? "";
     expect(afterDelivery).toMatch(/^adv \[on\].*1 accepted/m);
@@ -897,137 +799,127 @@ describe("delivery", () => {
   });
 
   it("lets an observer raise a point again after the bound threw its advisory away", async () => {
-    // The second half of the same defect. reconcile() adds a fingerprint to the dedupe
-    // set at DECISION time, so an advisory that was accepted and then evicted was
-    // destroyed twice: once by the eviction, and once permanently, because the observer
-    // could never raise the point again for the rest of the session.
+    // reconcile() adds a fingerprint to the dedupe set at DECISION time, so an advisory
+    // that was accepted, deferred, and then evicted by the deferral bound was destroyed
+    // twice: once by the eviction, and once permanently, because the observer could
+    // never raise the point again for the rest of the session. Eviction must forget().
+    //
+    // The deferral drains oldest-first whenever a window has room, so the only way an
+    // advisory is ever evicted UNDELIVERED is the shape driven here: the window fills,
+    // a veto then parks the advisory in the deferral, and enough traffic piles in
+    // behind it inside the same window to cross the bound.
     const h = harness();
+    let round = 0;
+    let proposeThePoint = false;
     const definitions: ObserverDefinition[] = [
-      def({ name: "adv", on: "turn_end", deliver: "settle" }),
+      def({ name: "adv", on: "turn_end" }),
+      def({ name: "goal", on: "turn_end", can: ["veto"] }),
     ];
     const runners: Record<string, ObserverRunner> = {
-      adv: emitting("adv", p("adv", "the point", { deliver: "settle", fingerprint: "stable" })),
+      adv: {
+        name: "adv",
+        run: async () =>
+          proposeThePoint ? p("adv", "the point", { fingerprint: "stable" }) : null,
+        dispose() {},
+      },
+      goal: {
+        name: "goal",
+        run: async () =>
+          round === 1 ? p("goal", "not met", { kind: "veto", fingerprint: "v" }) : null,
+        dispose() {},
+      },
     };
-    let round = 0;
-    // Two veto-capable observers reach the session ceiling of 40 vetoed settles; twelve
-    // advisory observers fill the 100-entry deferral several times over within them.
-    for (let v = 0; v < 2; v++) {
-      const name = `goal-${v}`;
-      definitions.push(def({ name, on: "turn_end", can: ["veto"], deliver: "settle" }));
-      runners[name] = {
-        name,
-        run: async () =>
-          p(name, "not met", { kind: "veto", deliver: "settle", fingerprint: `v-${round}` }),
-        dispose() {},
-      };
-    }
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 10; i++) {
       const name = `noise-${i}`;
-      definitions.push(def({ name, on: "turn_end", deliver: "settle" }));
+      definitions.push(def({ name, on: "turn_end" }));
       runners[name] = {
         name,
-        run: async () =>
-          p(name, `filler ${round}-${i}`, { deliver: "settle", fingerprint: `n-${round}-${i}` }),
+        run: async () => p(name, `filler ${round}-${i}`, { fingerprint: `n-${round}-${i}` }),
         dispose() {},
       };
     }
-    const { ctx } = await bootWith(h, definitions, runners, {
-      readSettingsBlock: () => ({ vetoBudget: 10, maxAdvisoriesPerTurn: 10 }),
+    const { ctx, notices } = await bootWith(h, definitions, runners, {
+      readSettingsBlock: () => ({ maxAdvisoriesPerTurn: 10 }),
     });
 
-    for (round = 0; round < 40; round++) {
+    // Round 0 fills the window; round 1's veto parks "the point" in the deferral;
+    // rounds 2-11 pile 100 fillers behind it until the bound evicts its batch.
+    for (round = 0; round < 12; round++) {
+      proposeThePoint = round === 1;
       await fire(h, "turn_end", {}, ctx);
       await tick();
-      await fire(h, "agent_settled", {}, ctx);
     }
-    expect(h.sent.every((m) => m.message.customType === "observer-veto")).toBe(true);
-    // "the point" was first into the deferral and is long gone.
     expect(h.sent.map((m) => String(m.message.content)).join("\n")).not.toContain("the point");
+    // Evicted, counted, and attributed -- not silently gone.
+    await h.commands.get("observers")?.handler("", ctx);
+    expect(notices.at(-1)?.message ?? "").toMatch(
+      /adv: 1 proposal\(s\) dropped; most recent - .*deferral bound/,
+    );
 
-    // It was evicted, so the observer must be able to raise it again.
+    // Drain the backlog across window boundaries, then re-raise the same fingerprint.
+    for (let i = 0; i < 15; i++) await fire(h, "agent_settled", {}, ctx);
     h.sent.length = 0;
-    for (round = 40; round < 100; round++) {
-      await fire(h, "turn_end", {}, ctx);
-      await tick();
-      await fire(h, "agent_settled", {}, ctx);
-    }
+    proposeThePoint = true;
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
     expect(h.sent.map((m) => String(m.message.content)).join("\n")).toContain("the point");
   });
 
-  it("bounds the deferral, so a veto storm cannot accumulate advisories without limit", async () => {
-    // Reachable, not hypothetical: src/settings.ts caps vetoBudget and
-    // maxAdvisoriesPerTurn at 10 each, so the session veto ceiling is 40 and each
-    // pre-empted settle can carry 10 advisories -- 400 deferrals against a bound of 100.
-    // Driven at exactly those limits so the bound is actually crossed rather than
-    // assumed unreachable.
+  it("bounds the deferral, so a long run cannot accumulate advisories without limit", async () => {
+    // Ten advisers and a cap of ten: the run's first flush fills the window, and every
+    // arrival after it defers. 40 round-trips without a window boundary push 390
+    // advisories at a bound of 100 -- driven past the bound so the eviction path runs
+    // rather than being assumed unreachable.
     const h = harness();
     const ADVISORS = 10;
     const definitions: ObserverDefinition[] = [];
     const runners: Record<string, ObserverRunner> = {};
     let round = 0;
-    // Two veto-capable observers with varying fingerprints: one alone stops at its own
-    // ceiling of 20, and the reconciler accepts at most one veto per turn, so two are
-    // what it takes to reach the session ceiling of 40.
-    for (let v = 0; v < 2; v++) {
-      const name = `goal-${v}`;
-      definitions.push(def({ name, on: "turn_end", can: ["veto"], deliver: "settle" }));
-      runners[name] = {
-        name,
-        run: async () =>
-          p(name, "not met", { kind: "veto", deliver: "settle", fingerprint: `v-${round}` }),
-        dispose() {},
-      };
-    }
     for (let i = 0; i < ADVISORS; i++) {
       const name = `adv-${i}`;
-      definitions.push(def({ name, on: "turn_end", deliver: "settle" }));
+      definitions.push(def({ name, on: "turn_end" }));
       runners[name] = {
         name,
-        run: async () =>
-          p(name, `advice ${round}-${i}`, { deliver: "settle", fingerprint: `f-${round}-${i}` }),
+        run: async () => p(name, `advice ${round}-${i}`, { fingerprint: `f-${round}-${i}` }),
         dispose() {},
       };
     }
     const { ctx, notices } = await bootWith(h, definitions, runners, {
-      readSettingsBlock: () => ({ vetoBudget: 10, maxAdvisoriesPerTurn: 10 }),
+      readSettingsBlock: () => ({ maxAdvisoriesPerTurn: 10 }),
     });
 
     for (round = 0; round < 40; round++) {
       await fire(h, "turn_end", {}, ctx);
       await tick();
-      await fire(h, "agent_settled", {}, ctx);
     }
-    // Every one of those settles was pre-empted by a veto -- confirm, or this test is
-    // measuring an ordinary delivery path.
-    expect(h.sent.every((m) => m.message.customType === "observer-veto")).toBe(true);
-    expect(h.sent).toHaveLength(40);
+    // Round 0 was delivered into the fresh window; everything since is deferred.
+    expect(h.sent).toHaveLength(1);
 
-    h.sent.length = 0;
-    // Each settle delivers at most maxAdvisoriesPerTurn (10 here). The backlog used to
-    // ignore that cap entirely and dump the whole deferral in one message.
-    await fire(h, "agent_settled", {}, ctx);
-    const first = String(h.sent[0]?.message.content ?? "");
-    expect(first.split("\n").filter((l: string) => l.startsWith("- [")).length).toBe(10);
-
-    // Drain the rest, then count across every message actually sent (not `at(-1)` in a
-    // loop, which re-counts the last message once the queue empties).
-    for (let i = 0; i < 20; i++) await fire(h, "agent_settled", {}, ctx);
+    // Window boundaries release the backlog at no more than maxAdvisoriesPerTurn each.
+    for (let i = 0; i < 12; i++) await fire(h, "agent_settled", {}, ctx);
+    for (const m of h.sent) {
+      const count = String(m.message.content)
+        .split("\n")
+        .filter((l: string) => l.startsWith("- [")).length;
+      expect(count).toBeLessThanOrEqual(10);
+    }
     const delivered = h.sent.map((m) => String(m.message.content)).join("\n");
     const lines = delivered.split("\n").filter((l: string) => l.startsWith("- ["));
-    expect(lines.length).toBe(MAX_HELD_PROPOSALS);
-    // The bound drops the OLDEST, so the most recent advice is what survives.
+    // Round 0 (10, delivered immediately) plus the backlog the bound let survive.
+    expect(lines.length).toBe(10 + MAX_HELD_PROPOSALS);
+    // The bound drops the OLDEST deferred batches; the newest advice survives, and so
+    // does what was delivered before the window filled.
+    expect(delivered).toContain("advice 0-0");
     expect(delivered).toContain("advice 39-9");
-    expect(delivered).not.toContain("advice 0-0");
+    expect(delivered).not.toContain("advice 15-5");
 
-    // 400 advisories in, 100 delivered. The other 300 must be counted as DROPPED, or
-    // /observers reports every one of these observers as healthy while three quarters
-    // of their output was thrown away.
+    // 400 advisories in, 110 delivered. The other 290 must be counted as DROPPED, or
+    // /observers reports every one of these observers as healthy while most of their
+    // output was thrown away.
     await h.commands.get("observers")?.handler("", ctx);
     const status = notices.at(-1)?.message ?? "";
     const totals = status.split("\n").reduce(
       (acc, line) => {
-        // Advisory observers only: the veto observers' own accepted counts are a
-        // separate story and would mask this one.
         if (!line.startsWith("adv-")) return acc;
         const accepted = line.match(/(\d+) accepted/);
         const dropped = line.match(/(\d+) dropped/);
@@ -1039,8 +931,8 @@ describe("delivery", () => {
       },
       { accepted: 0, dropped: 0 },
     );
-    expect(totals.accepted).toBe(MAX_HELD_PROPOSALS);
-    expect(totals.dropped).toBe(400 - MAX_HELD_PROPOSALS);
+    expect(totals.accepted).toBe(10 + MAX_HELD_PROPOSALS);
+    expect(totals.dropped).toBe(390 - MAX_HELD_PROPOSALS);
     expect(status).toMatch(/deferral bound/);
   });
 
@@ -1092,7 +984,6 @@ describe("delivery", () => {
 
     await fire(h, "turn_end", {}, ctx);
     await tick();
-    await fire(h, "agent_settled", {}, ctx);
     expect(h.sent).toHaveLength(1); // the veto; the advisory is deferred
 
     // Reload.
@@ -1112,8 +1003,9 @@ describe("delivery", () => {
    * consumed at the wrong drain point because none of them asked the only question that
    * matters: what happened to the proposal?
    *
-   * Every proposal entering drainFor must end up delivered, still held, or counted as
-   * dropped. There is no fourth outcome, and "spent, tallied, and discarded" was one.
+   * Every proposal entering a flush must end up delivered, still deferred, or counted
+   * as dropped. There is no fourth outcome, and "spent, tallied, and discarded" was
+   * one.
    */
   for (const kind of ["advisory", "veto"] as const) {
     for (const deliver of ["next_prompt", "next_turn", "settle"] as const) {
@@ -1181,12 +1073,12 @@ describe("delivery", () => {
     expect(seen).toEqual([true, false]);
   });
 
-  it("routes a veto to settle even when its definition declares another point", async () => {
-    // The routing rule was a disjunction, and its FIRST clause matched too: a
-    // `deliver: next_prompt` veto was consumed at before_agent_start, where budget was
-    // spent and the proposal was tallied -- and then dropped, because that handler
-    // renders advisories only. Its effect surfaced a turn later, reopening a turn whose
-    // work it had never seen.
+  it("routes a veto to a turn-triggering follow-up whatever deliver: declares", async () => {
+    // `deliver` is parsed independently of `can` in src/definitions.ts, so a definition
+    // can legitimately declare `can: [veto]` with `deliver: next_prompt`. Holding work
+    // open is only meaningful through the follow-up queue, so a veto rides it whatever
+    // its definition declared -- under the drain model this same shape was once consumed
+    // at before_agent_start, where budget was spent and the veto silently discarded.
     const h = harness();
     const d = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "next_prompt" });
     const veto = p("goal", "the stated goal is not met", {
@@ -1197,14 +1089,10 @@ describe("delivery", () => {
 
     await fire(h, "turn_end", {}, ctx);
     await tick();
-    // The wrong drain point must not consume it.
-    const early = await fire(h, "before_agent_start", {}, ctx);
-    expect(early).toBeUndefined();
-    expect(h.entries.filter((e) => e.customType === "observers-veto-spend")).toHaveLength(0);
-
-    await fire(h, "agent_settled", {}, ctx);
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0]?.message.customType).toBe("observer-veto");
+    expect(h.sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(h.entries.filter((e) => e.customType === "observers-veto-spend")).toHaveLength(1);
   });
 
   it("never spends veto budget for a veto it does not deliver", async () => {
@@ -1505,11 +1393,11 @@ describe("delivery", () => {
   });
 
   it("spends one veto budget unit however many times the observer ran", async () => {
-    // goal-tracker now triggers on turn_end, which fires once per LLM round-trip, so a
-    // single agent run can queue several identical vetoes. The prompt asks the model to
+    // goal-tracker triggers on turn_end, which fires once per LLM round-trip, so a
+    // single agent run can raise several identical vetoes. The prompt asks the model to
     // reuse the goal text as its fingerprint, but that is an unenforceable instruction.
-    // The property that actually holds is the reconciler's: at most one veto is accepted
-    // per drain, and only that one spends budget. It does not depend on the model
+    // The property that actually holds is the window's: at most one veto is delivered
+    // per window, and only that one spends budget. It does not depend on the model
     // cooperating.
     const h = harness();
     const d = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" });
@@ -1530,10 +1418,10 @@ describe("delivery", () => {
     expect(h.entries.filter((e) => e.customType === "observers-veto-spend")).toHaveLength(1);
   });
 
-  it("delivers a settle veto on the settle of the run that triggered it", async () => {
-    // The point of moving goal-tracker to turn_end: an agent run with tool work has
-    // several turn_ends before it settles, so the run kicked at the first one has
-    // finished by the time settle drains. This is the case option (a) was chosen to fix.
+  it("delivers a settle veto within the run that triggered it", async () => {
+    // The point of goal-tracker triggering on turn_end: an agent run with tool work has
+    // several turn_ends before it settles, so a run kicked at the first one lands while
+    // the agent is still working -- and the follow-up queue holds the run open for it.
     const h = harness();
     const d = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" });
     const veto = p("goal", "tests were never run", { kind: "veto", deliver: "settle" });
@@ -1586,8 +1474,8 @@ describe("delivery", () => {
   });
 
   it("sends a veto once, not on every subsequent settle", async () => {
-    // pendingVeto survives the handler that sends it unless it is cleared. An observer
-    // that vetoes once would otherwise re-trigger a turn at every settle, forever.
+    // A delivered veto must be consumed by its flush. An observer that vetoes once
+    // would otherwise re-trigger a turn at every settle, forever.
     const h = harness();
     const d = def({ name: "goal", on: "before_agent_start", can: ["veto"], deliver: "settle" });
     const veto = p("goal", "not done", { kind: "veto", deliver: "settle" });
@@ -1603,9 +1491,9 @@ describe("delivery", () => {
     expect(h.sent).toHaveLength(1);
   });
 
-  it("suppresses advisories on the settle where a veto fires", async () => {
-    // The veto already reopens the turn. Stacking an advisory onto the same settle
-    // sends two follow-ups for one event and buries the reason the turn reopened.
+  it("suppresses advisories on the flush where a veto fires", async () => {
+    // The veto already redirects the run. Stacking an advisory onto the same flush
+    // sends two messages for one moment and buries the reason the work reopened.
     const h = harness();
     const goalDef = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" });
     const memoDef = def({ name: "memo", on: "turn_end", deliver: "settle" });
@@ -1616,7 +1504,6 @@ describe("delivery", () => {
 
     await fire(h, "turn_end", {}, ctx);
     await tick();
-    await fire(h, "agent_settled", {}, ctx);
 
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0]?.message.customType).toBe("observer-veto");
@@ -1808,51 +1695,6 @@ describe("delivery", () => {
     expect(h.sent[0]?.message.content).toContain("the work is not done");
   });
 
-  it("bounds the held list, discarding the oldest proposal first", async () => {
-    // Requeued proposals are deferred, not dropped -- but an observer whose delivery
-    // point never fires would otherwise grow this list for the life of the session.
-    const count = MAX_HELD_PROPOSALS + 1;
-    const definitions = Array.from({ length: count }, (_, i) =>
-      def({ name: `obs${i}`, on: "turn_end", deliver: "settle" }),
-    );
-    const runners: Record<string, ObserverRunner> = {};
-    for (const [i, d] of definitions.entries()) {
-      runners[d.name] = emitting(
-        d.name,
-        p(d.name, `advice ${i}`, { deliver: "settle", fingerprint: `fp-${i}` }),
-      );
-    }
-    const h = harness();
-    const { ctx, notices } = await bootWith(h, definitions, runners);
-
-    await fire(h, "turn_end", {}, ctx);
-    await tick();
-    // Drains next_prompt: every settle-scoped proposal is requeued, and the bound bites.
-    await fire(h, "before_agent_start", {}, ctx);
-    await fire(h, "agent_settled", {}, ctx);
-    await h.commands.get("observers")?.handler("", ctx);
-
-    const status = notices.at(-1)?.message ?? "";
-    const tallied = status
-      .split("\n")
-      .flatMap((line) => {
-        const accepted = line.match(/(\d+) accepted/);
-        const dropped = line.match(/(\d+) dropped/);
-        return accepted && dropped ? [Number(accepted[1]) + Number(dropped[1])] : [];
-      })
-      .reduce((a, b) => a + b, 0);
-    // Every proposal is accounted for, INCLUDING the one the bound discarded. It used
-    // to vanish: 101 proposals in, 100 accounted for, and the observer whose advice was
-    // thrown away reported "0 accepted, 0 dropped" -- indistinguishable from an observer
-    // that had chosen to stay silent.
-    expect(tallied).toBe(count);
-    // Oldest first: obs0 is the one the bound discarded.
-    const rowZero = status.split("\n").find((l) => l.startsWith("obs0 "));
-    expect(rowZero).toContain("0 accepted");
-    expect(rowZero).toContain("1 dropped");
-    expect(status).toMatch(/obs0: 1 proposal\(s\) dropped; most recent - .*hold bound/);
-  });
-
   it("pairs tool arguments captured at execution start onto the record at end", async () => {
     // ToolExecutionEndEvent carries no args; only the start event does.
     const h = harness();
@@ -1941,41 +1783,25 @@ describe("session_start resets", () => {
     expect(notices.at(-1)?.message).toMatch(/0 accepted/);
   });
 
-  it("clears held proposals, so last session's advice is not delivered in this one", async () => {
+  it("does not let a run started in the old session deliver into the new one", async () => {
+    // An in-flight observer run survives the boundary: abortAll() only signals, and a
+    // run that ignores its signal still resolves. Its arrival lands in the OLD bus,
+    // whose flush callback must find the old queue gone -- session_start rebuilds the
+    // bus, so a late resolution can at worst flush the new, empty one.
     const h = harness();
-    const settle = p("obs", "stale advice", { deliver: "settle" });
-    const { ctx } = build(h, emitting("obs", settle), {
+    const veto = p("goal", "stale veto", { kind: "veto", deliver: "settle" });
+    const { ctx } = build(h, slow("goal", veto), {
       discover: () => ({
-        observers: [def({ name: "obs", on: "turn_end", deliver: "settle" })],
+        observers: [def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" })],
         errors: [],
       }),
     });
     await fire(h, "session_start", {}, ctx);
-    await fire(h, "turn_end", {}, ctx);
+    await fire(h, "turn_end", {}, ctx); // the run is now in flight
+
+    await fire(h, "session_start", {}, ctx); // reload before it lands
     await tick();
-    await fire(h, "before_agent_start", {}, ctx); // requeues it into `held`
-
-    await fire(h, "session_start", {}, ctx);
-    await fire(h, "agent_settled", {}, ctx);
-    expect(h.sent).toHaveLength(0);
-  });
-
-  it("clears a pending veto, so it cannot fire into the next session", async () => {
-    // A veto declaring deliver:next_prompt is reconciled during the next_prompt drain,
-    // which sets pendingVeto without sending anything -- only agent_settled sends. That
-    // is the window in which a reload can strand one.
-    const h = harness();
-    const vetoDef = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "next_prompt" });
-    const veto = p("goal", "stale veto", { kind: "veto", deliver: "next_prompt" });
-    const { ctx } = build(h, emitting("goal", veto), {
-      discover: () => ({ observers: [vetoDef], errors: [] }),
-    });
-    await fire(h, "session_start", {}, ctx);
-    await fire(h, "turn_end", {}, ctx);
     await tick();
-    await fire(h, "before_agent_start", {}, ctx);
-
-    await fire(h, "session_start", {}, ctx);
     await fire(h, "agent_settled", {}, ctx);
     expect(h.sent).toHaveLength(0);
   });
@@ -2288,76 +2114,6 @@ describe("observer status notes", () => {
     const out = await s.read();
     expect(out).not.toContain("obs: ");
     expect(out).toContain("1 accepted");
-  });
-});
-
-/* ------------------------------------------------------------------ *
- * Trigger/delivery timing: an observer is always one occurrence late
- * ------------------------------------------------------------------ */
-
-describe("kick and drain in the same handler", () => {
-  async function boot(h: Harness, definition: ObserverDefinition, runner: ObserverRunner) {
-    const { ctx } = makeCtx({ cwd, entries: h.entries, model: { provider: "p", id: "m" } });
-    createExtension(
-      h.pi,
-      deps({
-        discover: () => ({ observers: [definition], errors: [] }),
-        createRunner: async () => runner,
-      }),
-    );
-    await fire(h, "session_start", {}, ctx);
-    return ctx;
-  }
-
-  it("cannot deliver a settle proposal on the settle that triggered it", async () => {
-    // This is the shipped goal-tracker and verification configuration verbatim:
-    // `on: agent_settled` with `deliver: settle`. The agent_settled handler kicks the
-    // run and then drains "settle" in the same synchronous body, so the run it just
-    // started cannot possibly be in that drain -- the bus resolves it on a later tick
-    // by design ("an observer must not add latency to a turn"). The veto is therefore
-    // always deferred to the NEXT settle, and in a session with only one settle it is
-    // never delivered at all.
-    const h = harness();
-    const d = def({ name: "goal", on: "agent_settled", can: ["veto"], deliver: "settle" });
-    const veto = p("goal", "the goal is not met", { kind: "veto", deliver: "settle" });
-    const ctx = await boot(h, d, slow("goal", veto));
-
-    await fire(h, "agent_settled", {}, ctx);
-    await tick();
-    expect(h.sent).toHaveLength(0);
-
-    // The next settle picks up the previous settle's veto.
-    await fire(h, "agent_settled", {}, ctx);
-    expect(h.sent).toHaveLength(1);
-    expect(h.sent[0]?.message.customType).toBe("observer-veto");
-  });
-
-  it("cannot deliver a next_prompt proposal on the before_agent_start that triggered it", async () => {
-    // The shipped skill-recall configuration: `on: before_agent_start` with
-    // `deliver: next_prompt`. Same shape, same one-occurrence lag.
-    const h = harness();
-    const d = def({ name: "skill", on: "before_agent_start", deliver: "next_prompt" });
-    const ctx = await boot(h, d, slow("skill", p("skill", "use the parser skill")));
-
-    expect(await fire(h, "before_agent_start", {}, ctx)).toBeUndefined();
-    await tick();
-    const second = await fire(h, "before_agent_start", {}, ctx);
-    expect(second?.message?.content).toContain("use the parser skill");
-  });
-
-  it("delivers on the first opportunity when the trigger and the delivery point differ", async () => {
-    // The shipped memory-recall configuration: `on: turn_end` with
-    // `deliver: next_prompt`. Two distinct events, so the run has the whole gap
-    // between them to finish -- this is the only bundled observer whose advice can
-    // land on the very next delivery point.
-    const h = harness();
-    const d = def({ name: "memory", on: "turn_end", deliver: "next_prompt" });
-    const ctx = await boot(h, d, slow("memory", p("memory", "you wrote a note about this")));
-
-    await fire(h, "turn_end", {}, ctx);
-    await tick();
-    const result = await fire(h, "before_agent_start", {}, ctx);
-    expect(result?.message?.content).toContain("you wrote a note about this");
   });
 });
 
@@ -2749,12 +2505,12 @@ describe("commands", () => {
     await h.commands.get("observers")?.handler("disable obs", ctx);
     await fire(h, "turn_end", {}, ctx);
     await tick();
-    expect(await fire(h, "before_agent_start", {}, ctx)).toBeUndefined();
+    expect(h.sent).toHaveLength(0);
 
     await h.commands.get("observers")?.handler("enable obs", ctx);
     await fire(h, "turn_end", {}, ctx);
     await tick();
-    expect(await fire(h, "before_agent_start", {}, ctx)).toBeDefined();
+    expect(h.sent).toHaveLength(1);
   });
 
   it("cannot enable an observer that never built a runner", async () => {
@@ -2813,5 +2569,296 @@ describe("commands", () => {
     await fire(h, "session_start", {}, ctx);
     await h.commands.get("remember")?.handler("something", ctx);
     expect(notices.at(-1)?.type).toBe("error");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Arrival-driven delivery
+ *
+ * Proposals are delivered the moment they land, through pi's steering and
+ * follow-up queues, instead of waiting for a fixed drain point. pi guarantees a
+ * queued steer/followUp message is delivered inside the current run (the run
+ * cannot settle past it), and an idle-delivered message is appended to the
+ * session immediately -- which is what closes the "advice lands one request
+ * late" and "advice dies with the session" limitations.
+ * ------------------------------------------------------------------ */
+
+describe("arrival-driven delivery", () => {
+  async function boot(
+    h: Harness,
+    definitions: ObserverDefinition[],
+    runners: Record<string, ObserverRunner>,
+    over: Partial<ObserverDeps> = {},
+  ) {
+    const { ctx, notices } = makeCtx({
+      cwd,
+      entries: h.entries,
+      model: { provider: "p", id: "m" },
+    });
+    createExtension(
+      h.pi,
+      deps({
+        discover: () => ({ observers: definitions, errors: [] }),
+        createRunner: async (opts) => {
+          const runner = runners[opts.def.name];
+          if (!runner) throw new Error(`no runner for ${opts.def.name}`);
+          return runner;
+        },
+        ...over,
+      }),
+    );
+    await fire(h, "session_start", {}, ctx);
+    return { ctx, notices };
+  }
+
+  it("delivers a next_prompt advisory as a steer message the moment it lands", async () => {
+    const h = harness();
+    const d = def({ name: "obs", on: "turn_end", deliver: "next_prompt" });
+    const { ctx } = await boot(h, [d], { obs: emitting("obs", p("obs", "check the tests")) });
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.message.customType).toBe("observer-advisory");
+    expect(h.sent[0]?.message.content).toContain("check the tests");
+    expect(h.sent[0]?.options).toEqual({ deliverAs: "steer" });
+    expect(h.entries.filter((e) => e.customType === "observers-accepted")).toHaveLength(1);
+  });
+
+  it("treats deliver: next_turn as steer at arrival", async () => {
+    const h = harness();
+    const d = def({ name: "obs", on: "turn_end", deliver: "next_turn" });
+    const { ctx } = await boot(h, [d], {
+      obs: emitting("obs", p("obs", "watch the budget", { deliver: "next_turn" })),
+    });
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.options).toEqual({ deliverAs: "steer" });
+  });
+
+  it("delivers a settle advisory as a follow-up at arrival, before any settle event", async () => {
+    const h = harness();
+    const d = def({ name: "obs", on: "turn_end", deliver: "settle" });
+    const { ctx } = await boot(h, [d], {
+      obs: emitting("obs", p("obs", "verify before closing", { deliver: "settle" })),
+    });
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.message.content).toContain("verify before closing");
+    expect(h.sent[0]?.options).toEqual({ deliverAs: "followUp" });
+  });
+
+  it("delivers a veto as a turn-triggering follow-up at arrival, not at the next settle", async () => {
+    const h = harness();
+    const d = def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" });
+    const veto = p("goal", "the stated goal is not met", { kind: "veto", deliver: "settle" });
+    const { ctx } = await boot(h, [d], { goal: emitting("goal", veto) });
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.message.customType).toBe("observer-veto");
+    expect(h.sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    // The spend entry is written at delivery, exactly as it was at the settle drain.
+    expect(h.entries.filter((e) => e.customType === "observers-veto-spend")).toHaveLength(1);
+  });
+
+  it("batches proposals landing in the same tick into one message, priority order", async () => {
+    const h = harness();
+    const { ctx } = await boot(
+      h,
+      [
+        def({ name: "low", on: "turn_end", priority: 10 }),
+        def({ name: "high", on: "turn_end", priority: 90 }),
+      ],
+      {
+        low: emitting("low", p("low", "minor nit", { priority: 10 })),
+        high: emitting("high", p("high", "major problem", { priority: 90 })),
+      },
+    );
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+
+    expect(h.sent).toHaveLength(1);
+    const content = String(h.sent[0]?.message.content);
+    expect(content.indexOf("major problem")).toBeGreaterThan(-1);
+    expect(content.indexOf("major problem")).toBeLessThan(content.indexOf("minor nit"));
+  });
+
+  it("holds an advisory over the window cap and delivers it after the window resets", async () => {
+    const h = harness();
+    const { ctx } = await boot(
+      h,
+      [
+        def({ name: "a", on: "turn_end" }),
+        def({ name: "b", on: "turn_end" }),
+        def({ name: "c", on: "turn_end" }),
+      ],
+      {
+        a: emitting("a", p("a", "first advisory")),
+        b: emitting("b", p("b", "second advisory")),
+        // Lands two macrotask hops out: the first hop is scheduled before the flush
+        // timer and would still join a and b's batch. Two hops put the arrival after
+        // their flush has filled the window of 2, so this one is deferred rather than
+        // reconciler-dropped.
+        c: {
+          name: "c",
+          async run() {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            return p("c", "third advisory");
+          },
+          dispose() {},
+        },
+      },
+    );
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    await tick();
+    await tick();
+
+    expect(h.sent).toHaveLength(1);
+    expect(String(h.sent[0]?.message.content)).not.toContain("third advisory");
+
+    // The window resets at the next request; the handler returns nothing (delivery
+    // goes through sendMessage now) and the deferred advisory goes out.
+    const result = await fire(h, "before_agent_start", { prompt: "next" }, ctx);
+    expect(result).toBeUndefined();
+    expect(h.sent).toHaveLength(2);
+    expect(String(h.sent[1]?.message.content)).toContain("third advisory");
+  });
+
+  it("defers advisories flushed alongside a veto and delivers them at a later flush", async () => {
+    const h = harness();
+    const advisory = p("adv", "the new test file has no assertions", { deliver: "settle" });
+    const veto = p("goal", "the stated goal is not met", { kind: "veto", deliver: "settle" });
+    const { ctx } = await boot(
+      h,
+      [
+        def({ name: "adv", on: "turn_end", deliver: "settle" }),
+        def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" }),
+      ],
+      { adv: emitting("adv", advisory), goal: emitting("goal", veto) },
+    );
+
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.message.customType).toBe("observer-veto");
+
+    // The redo settles; the deferred advisory goes out on that flush.
+    await fire(h, "agent_settled", {}, ctx);
+    expect(h.sent).toHaveLength(2);
+    expect(h.sent[1]?.message.customType).toBe("observer-advisory");
+    expect(String(h.sent[1]?.message.content)).toContain("no assertions");
+  });
+
+  it("delivers nothing after shutdown, even with a flush still pending", async () => {
+    const h = harness();
+    const d = def({ name: "obs", on: "turn_end" });
+    const { ctx } = await boot(h, [d], { obs: slow("obs", p("obs", "too late")) });
+
+    await fire(h, "turn_end", {}, ctx);
+    await fire(h, "session_shutdown", {}, ctx);
+    await tick();
+    await tick();
+
+    expect(h.sent).toHaveLength(0);
+  });
+
+  it("delivers a before_agent_start observer's advisory during the request it is about", async () => {
+    // The shipped skill-recall shape: on: before_agent_start, deliver: next_prompt.
+    // Under the drain model this was structurally one request late -- the same handler
+    // that kicked the run drained its delivery point. At arrival, the advisory goes out
+    // as a steer a beat after the run starts, and pi injects it before the run's next
+    // LLM call: it reaches the request it is actually about on any run longer than one
+    // round-trip.
+    const h = harness();
+    const d = def({ name: "skill", on: "before_agent_start", deliver: "next_prompt" });
+    const { ctx } = await boot(h, [d], {
+      skill: slow("skill", p("skill", "use the parser skill")),
+    });
+
+    expect(await fire(h, "before_agent_start", { prompt: "parse this" }, ctx)).toBeUndefined();
+    await tick();
+    await tick();
+
+    expect(h.sent).toHaveLength(1);
+    expect(String(h.sent[0]?.message.content)).toContain("use the parser skill");
+    expect(h.sent[0]?.options).toEqual({ deliverAs: "steer" });
+  });
+
+  it("delivers an agent_settled observer's advisory at arrival, not one occurrence late", async () => {
+    // The old drain model could never deliver this: verification triggers at
+    // agent_settled and its advice waited for a next_prompt that a closed session
+    // never sends. At arrival the session is idle, so pi appends the message to the
+    // session immediately -- persisted and visible, whatever happens next.
+    const h = harness();
+    const d = def({ name: "verify", on: "agent_settled", deliver: "next_prompt" });
+    const { ctx } = await boot(h, [d], {
+      verify: emitting("verify", p("verify", "the claimed test run is absent")),
+    });
+
+    await fire(h, "agent_settled", {}, ctx);
+    await tick();
+
+    expect(h.sent).toHaveLength(1);
+    expect(String(h.sent[0]?.message.content)).toContain("claimed test run is absent");
+  });
+});
+
+describe("one veto per window", () => {
+  async function boot(h: Harness, runner: ObserverRunner) {
+    const { ctx } = makeCtx({ cwd, entries: h.entries, model: { provider: "p", id: "m" } });
+    createExtension(
+      h.pi,
+      deps({
+        discover: () => ({
+          observers: [def({ name: "goal", on: "turn_end", can: ["veto"], deliver: "settle" })],
+          errors: [],
+        }),
+        createRunner: async () => runner,
+      }),
+    );
+    await fire(h, "session_start", {}, ctx);
+    return ctx;
+  }
+
+  it("delivers at most one veto per window, without spending budget on the suppressed ones", async () => {
+    // Arrival-driven flushes are per-proposal, so the reconciler's one-veto-per-batch
+    // rule no longer bounds a run: a goal observer re-vetoing on every round-trip of
+    // the same run would deliver vetoBudget redundant vetoes back to back. The window
+    // is the arrival-driven stand-in for "per settle".
+    const h = harness();
+    const veto = p("goal", "the goal is not met", {
+      kind: "veto",
+      deliver: "settle",
+      fingerprint: "the-goal",
+    });
+    const ctx = await boot(h, emitting("goal", veto));
+
+    for (let roundTrip = 0; roundTrip < 3; roundTrip++) {
+      await fire(h, "turn_end", {}, ctx);
+      await tick();
+    }
+    expect(h.sent).toHaveLength(1);
+    expect(h.entries.filter((e) => e.customType === "observers-veto-spend")).toHaveLength(1);
+
+    // A window boundary re-arms it: the goal is still unmet after the redo settles.
+    await fire(h, "agent_settled", {}, ctx);
+    await fire(h, "turn_end", {}, ctx);
+    await tick();
+    expect(h.sent).toHaveLength(2);
+    expect(h.entries.filter((e) => e.customType === "observers-veto-spend")).toHaveLength(2);
   });
 });

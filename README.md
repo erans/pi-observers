@@ -4,8 +4,10 @@ File-defined observer agents for [pi](https://pi.dev). Observers watch one axis 
 quality each, propose at most a short advisory, and a reconciler decides what reaches
 the main agent. They are read-only and never answer on the agent's behalf.
 
-The pattern is taken from Meta's Muse Code. Its four observers ship as bundled
-examples -- they are plain files in the same format any observer uses.
+The pattern is inspired by the persistent background agents of Meta's Muse Code
+(Meta's own docs are login-gated and name no observer roster; the four bundled here
+are this project's design). They ship as worked examples -- plain files in the same
+format any observer uses.
 
 ## Install
 
@@ -55,7 +57,7 @@ skipped.
     sees: [last_user_message]       # last_assistant_message | tool_calls_this_turn | transcript | skills
     tools: [read, grep]             # read-only only: read, grep, find, ls
     can: [advise]                   # advise, veto
-    deliver: next_prompt            # next_prompt | next_turn | settle
+    deliver: next_prompt            # next_prompt | next_turn (both: steer) | settle (follow-up)
     model: anthropic/claude-haiku-4-5
     fallback: [openai-codex/gpt-5.5]
     priority: 50
@@ -71,30 +73,31 @@ fetches with `read`/`grep`.
 
 ### Choosing `on:` and `deliver:`
 
-Observers never block a turn. A run started by a lifecycle event resolves after that
-event's handler has already returned, so **an observer whose `on:` trigger is the same
-event that drains its `deliver:` point is always one occurrence late** -- and in a
-session with only one such occurrence, it is never delivered at all.
+Observers never block a turn, and their proposals are delivered **the moment they are
+ready** through pi's own message queues -- there is no waiting for a fixed drain point.
+`deliver:` chooses which queue an advisory rides:
 
-Two triggers drain a delivery point in the same handler that starts the run:
+| `deliver:` | pi queue | Arrives |
+|---|---|---|
+| `next_prompt`, `next_turn` | steering | before the run's next model call; appended to the session immediately when idle |
+| `settle` | follow-up | once the agent has no more tool calls -- after the work, before the run closes |
 
-| `on:` | drains |
-|---|---|
-| `before_agent_start` | `next_prompt` |
-| `agent_settled` | `settle` |
+The two steering values are aliases: the distinction between them belonged to an older
+drain-point design and has no arrival-driven analogue. Use `next_prompt` for guidance
+the agent should see as soon as possible, and `settle` for commentary on finished work.
 
-So pick a trigger *earlier* than your delivery point. `on: turn_end` with
-`deliver: settle` is the reliable pairing for anything judging finished work: an agent
-run doing real work has several turns before it settles, which is the room the observer
-needs to finish.
+A veto always rides the follow-up queue with a turn trigger, whatever `deliver:` says:
+formed mid-run, it holds the run open -- pi will not settle a run past a queued
+follow-up -- and formed after the run has settled, it reopens it. At most one veto is
+delivered per turn; further vetoes in the same turn are dropped without spending any
+budget, and the goal still being unmet next turn is what re-raises them.
 
-A `can: [veto]` observer must never trigger on its own delivery point -- a late veto
-reopens the turn after the one whose work it judged. For a veto, "its own delivery
-point" is **always `settle`**, whatever `deliver:` says: holding the turn open is only
-meaningful there, so every veto is routed to `settle` and the `deliver:` field is
-ignored for it. Setting `deliver: next_prompt` on a `can: [veto]` observer does not move
-its veto and does not make `on: agent_settled` safe. Read the row above as
-`agent_settled` drains every veto, full stop.
+Pick `on:` for what the observer needs to *see*, not for when its advice can land:
+
+- `before_agent_start` is the only trigger that sees the request about to run.
+- `turn_end` fires once per model round-trip, so a run doing real work kicks the
+  observer several times while there is still run left for the advice to land in.
+- `agent_settled` is the only trigger that sees the agent's final message.
 
 `tool_calls_this_turn` accumulates over a whole agent run (your request through the
 agent's final answer), not one model round-trip, so an observer reading it at
@@ -105,69 +108,48 @@ appended to the ones that preceded the veto. An observer judging a post-veto red
 the whole run including the vetoed attempt, which is usually what you want and is worth
 knowing if you write a prompt that counts calls.
 
-#### Known limitation: a `goal-tracker` veto can arrive after the work is done
+#### What arrival-driven delivery buys, and what it still cannot
 
-`goal-tracker` triggers on `turn_end` and delivers at `settle`, which keeps it off its
-own delivery point -- but it is still racing the agent. Its veto lands on the first
-`settle` that follows its model call, and if the agent finishes the rest of its work
-faster than that call takes, the veto arrives after the run is over. It then reopens the
-turn and the agent addresses the unmet goal a beat later than it could have.
+Three limitations of the older fixed-drain design are gone or reduced:
 
-The residual is *latency, not incorrectness*: what arrives late is a veto that was true
-when it was formed and is still true now, since the goal is still unmet. It never sends
-the agent back over work it had rightly moved past. Closing it entirely would mean
-blocking the turn on a model call, which the design refuses for every observer.
+- **A `goal-tracker` veto joins the run it judges.** A veto formed while the agent is
+  still working is queued as a follow-up, and pi holds the run open for it -- the agent
+  addresses the unmet goal inside the same run instead of being sent back after it
+  thought it had finished. Only on a single-round-trip answer does the veto form after
+  the settle; it then reopens the turn, which is latency, not incorrectness: the goal
+  is still unmet when it lands.
+- **`skill-recall` reaches the request it read.** Its run starts at
+  `before_agent_start` and finishes a few seconds in; the suggestion is steered into
+  the run and precedes the next model call. On a single-round-trip answer the run is
+  over before the suggestion is ready, and it is appended to the session for the next
+  request instead -- the old behaviour, now the fallback rather than the rule.
+- **Advice never needs a next prompt to be seen.** A proposal that arrives while the
+  session is idle is appended to the session immediately: persisted, displayed, and in
+  context for whatever you ask next. Closing the session no longer discards advice that
+  was ready; `verification`'s report on the run that just finished is on screen moments
+  after the settle.
 
-One case is loss rather than latency. If the session **ends** while the run is still in
-flight -- a one-shot `pi -p`, or you quit right after the answer -- shutdown aborts the
-run and the verdict is discarded. There is no later `settle` to hold it for, and pi is
-already tearing down, so there is nowhere to report it either.
+What remains, and why:
 
-Measured against a live model, an observer's own call is 1.4-5.5s. That is not slow
-enough to be worth tuning `timeout_ms` over -- the default 20s is nowhere near binding.
-The gap it loses to is the last `turn_end` to `agent_settled`, which is microseconds of
-synchronous work. So on a run with several turns an earlier kick finishes in time and
-the veto lands normally; on a single-round-trip answer there is no earlier kick, and the
-verdict always arrives after the settle it was meant to inform.
+- **A session that ends mid-run discards the run.** In a one-shot `pi -p`, or if you
+  quit the instant the answer lands, shutdown aborts observer runs still in flight and
+  their verdicts are never formed. Catching them would mean holding shutdown open on a
+  model call, which the non-blocking design refuses.
+- **A single-round-trip answer is faster than any observer.** An observer's own model
+  call measures 1.4-5.5s; a run with no tool work is often shorter. Nothing formed
+  during such a run can land inside it. The advice is not lost -- it is appended for
+  the next request -- but it cannot inform the answer it was about.
 
-#### Known limitation: `skill-recall` advises the next request
+#### Deferral
 
-`skill-recall` is the one bundled observer that cannot follow the rule above. Its job
-is to suggest a skill for the request that is *about to* run, so `before_agent_start`
-is the only trigger that sees the right request -- and that handler is also where
-`next_prompt` is drained. Its suggestion therefore lands on your **next** request
-rather than the current one.
-
-At that trigger the request has not been recorded in the session yet, so
-`last_user_message` is taken from the event rather than looked up. Reading the session
-there returns the *previous* request, or nothing at all on the first request of a
-session -- which is what `skill-recall` was actually being handed until this was fixed:
-an empty slice, and a prompt asking it to choose a skill with no request in hand.
-
-This is a consequence of the non-blocking design, not an oversight. Serving the current
-request would mean holding it open while a second model call finished, which is latency
-on every request to catch the minority that need a skill. If you want that trade, the
-change is a bounded await in the `before_agent_start` handler; nothing in the observer
-format needs to change.
-
-#### Known limitation: a `next_prompt` advisory needs a next prompt
-
-The same mechanism, one delivery point over. `verification` triggers at `agent_settled`
-and delivers at `next_prompt`, which is drained at `before_agent_start` -- so if you
-close the session, or never send another request, its advice about the run that just
-finished is never shown.
-
-Advice that misses its moment is deferred rather than discarded, in two places, and both
-are bounded at 100 proposals with the oldest dropped first:
-
-- a proposal whose delivery point has not come round yet waits for it;
-- an advisory that was ready at a `settle` where a veto took priority waits for the next
-  `settle`, and is then released at no more than `maxAdvisoriesPerTurn` per turn.
-
-The second queue does not survive a `/reload`, and either queue can drop its oldest
-entries under sustained load. When that happens the advisory is counted as **dropped**
-for its observer in `/observers`, with the reason, and the observer is free to raise the
-same point again -- it is not silently recorded as delivered.
+Delivery is capped at `maxAdvisoriesPerTurn` per turn (the counter resets at each new
+request and each settle). Advice over the cap, and advisories that shared a flush with
+a veto, are deferred to a later flush rather than dropped -- oldest first, released
+into whatever budget the next turn has. The deferral is bounded at 100 proposals with
+the oldest evicted first; it does not survive a `/reload`. When an advisory is evicted
+the observer's `/observers` row counts it as **dropped**, with the reason, and the
+observer is free to raise the same point again -- it is not silently recorded as
+delivered.
 
 ## Commands
 

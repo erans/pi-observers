@@ -430,3 +430,43 @@ Logic lives in pure functions so the bulk of the suite needs no model and no pi 
   leave — cosmetic, user's call.
 - No git repository initialized in the working directory yet.
 - Whether `verification` should ship enabled rather than matching Muse's default.
+
+---
+
+## Addendum (2026-08-06): arrival-driven delivery
+
+Supersedes §8 (Delivery) and the drain-point half of §10 (Runtime). Trigger semantics
+(§4), slices (§5), tools (§6), the output contract (§7), and model resolution (§9) are
+unchanged.
+
+The fixed drain points -- `before_agent_start` returning a message, the `context`
+event, and the settle drain -- are replaced by delivery at proposal arrival, through
+pi's own message queues (verified against pi 0.84.0):
+
+- `pi.sendMessage(..., { deliverAs: "steer" })` queues during streaming and is
+  injected before the run's next LLM call; when idle it is appended to the session
+  immediately, with no turn triggered.
+- `deliverAs: "followUp"` is delivered once the agent has no more tool calls, and pi
+  will not settle a run past a queued follow-up (`_runAgentPrompt` continues the loop
+  while `agent.hasQueuedMessages()`).
+
+Routing: advisories declaring `next_prompt`/`next_turn` ride steer (the two are now
+aliases); `settle` advisories ride follow-up; a veto is always a turn-triggering
+follow-up regardless of `deliver:`.
+
+Mechanics: the bus notifies on arrival; a zero-delay debounce batches proposals
+landing in the same tick so `priority` still ranks them; the reconciler runs at flush
+time and is unchanged. Two per-window controls replace the per-drain ones, the window
+resetting at `before_agent_start` and `agent_settled`: at most `maxAdvisoriesPerTurn`
+advisories are delivered per window (surplus is deferred, bounded at 100, oldest
+evicted with a counted drop and a dedupe `forget()`), and at most one veto is
+delivered per window (further vetoes are dropped before reconcile, spending no
+budget).
+
+Effect on the known limitations of the drain design: a goal-tracker veto formed
+mid-run now joins the run it judges; skill-recall's suggestion reaches the request it
+read on any run longer than one round-trip; advice arriving while idle is persisted
+and shown immediately instead of waiting for a next prompt that may never come. Still
+open, by design: a session that ends mid-run aborts in-flight observer runs (catching
+them would block shutdown on a model call), and nothing formed during a
+single-round-trip answer can land inside it.
