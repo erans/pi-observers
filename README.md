@@ -13,8 +13,17 @@ format any observer uses.
 
     pi install npm:pi-observers
 
-Or load directly for development:
+Published as [`pi-observers` on npm](https://www.npmjs.com/package/pi-observers);
+requires pi >= 0.83. The four bundled observers load immediately -- `/observers` in
+any pi session shows them. To remove:
 
+    pi uninstall npm:pi-observers
+
+For development, clone [erans/pi-observers](https://github.com/erans/pi-observers)
+and load the extension straight from the checkout:
+
+    git clone https://github.com/erans/pi-observers.git
+    cd pi-observers && npm install
     pi -e ./src/index.ts
 
 ## Bundled observers
