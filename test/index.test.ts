@@ -518,6 +518,91 @@ describe("collectSliceState", () => {
     expect(state.transcript).not.toContain("entry-0-");
   });
 
+  // Observed live: an observer's transcript opened with pi's bookkeeping and another
+  // extension's custom entry, spending both context and tail-truncation budget on events
+  // no observer can act on.
+  it("keeps conversation entries and drops bookkeeping from the transcript", () => {
+    const mixed = [
+      { type: "model_change", provider: "p", modelId: "m" },
+      { type: "thinking_level_change", thinkingLevel: "xhigh" },
+      { type: "session_info", id: "s1" },
+      { type: "custom", customType: "extmgr-auto-update", data: { intervalMs: 86400000 } },
+      { type: "message", message: { role: "user", content: "KEEP-user-turn" } },
+      { type: "compaction", summary: "KEEP-compaction-summary" },
+    ];
+    const state = collectSliceState({
+      sees: ["transcript"],
+      ctx: { sessionManager: { getBranch: () => mixed, buildContextEntries: () => mixed } },
+      turnToolCalls: [],
+      commands: [],
+    });
+    expect(state.transcript).toContain("KEEP-user-turn");
+    // compaction stands in for the history it replaced -- dropping it loses conversation.
+    expect(state.transcript).toContain("KEEP-compaction-summary");
+    expect(state.transcript).not.toContain("model_change");
+    expect(state.transcript).not.toContain("thinking_level_change");
+    expect(state.transcript).not.toContain("session_info");
+    expect(state.transcript).not.toContain("extmgr-auto-update");
+  });
+
+  // This extension's own advisories and vetoes reach the session as custom entries.
+  // Feeding them back lets observers read what observers already said.
+  it("does not feed this extension's own advisories back to an observer", () => {
+    const withOwnOutput = [
+      { type: "message", message: { role: "user", content: "the real request" } },
+      { type: "custom", customType: "observer-advisory", content: "ECHO-prior-advisory" },
+      { type: "custom", customType: "observer-veto", content: "ECHO-prior-veto" },
+    ];
+    const state = collectSliceState({
+      sees: ["transcript"],
+      ctx: {
+        sessionManager: {
+          getBranch: () => withOwnOutput,
+          buildContextEntries: () => withOwnOutput,
+        },
+      },
+      turnToolCalls: [],
+      commands: [],
+    });
+    expect(state.transcript).toContain("the real request");
+    expect(state.transcript).not.toContain("ECHO-prior-advisory");
+    expect(state.transcript).not.toContain("ECHO-prior-veto");
+  });
+
+  // A type this extension has not classified is bookkeeping until proven otherwise.
+  it("drops an entry with an unknown or missing type", () => {
+    const odd = [
+      { type: "message", message: { role: "user", content: "KEEP-me" } },
+      { type: "some_future_pi_entry", payload: "DROP-unknown" },
+      { payload: "DROP-typeless" },
+      null,
+    ];
+    const state = collectSliceState({
+      sees: ["transcript"],
+      ctx: { sessionManager: { getBranch: () => odd, buildContextEntries: () => odd } },
+      turnToolCalls: [],
+      commands: [],
+    });
+    expect(state.transcript).toContain("KEEP-me");
+    expect(state.transcript).not.toContain("DROP-unknown");
+    expect(state.transcript).not.toContain("DROP-typeless");
+  });
+
+  // Filtering must not resurrect a slice that has no content left.
+  it("reports a transcript of nothing but bookkeeping as unavailable", () => {
+    const noise = [
+      { type: "model_change", provider: "p", modelId: "m" },
+      { type: "custom", customType: "extmgr-auto-update" },
+    ];
+    const state = collectSliceState({
+      sees: ["transcript"],
+      ctx: { sessionManager: { getBranch: () => noise, buildContextEntries: () => noise } },
+      turnToolCalls: [],
+      commands: [],
+    });
+    expect(state.transcript).toBeUndefined();
+  });
+
   it("reports an unreadable session as unavailable rather than throwing", () => {
     const state = collectSliceState({
       sees: ["last_user_message", "transcript"],

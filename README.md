@@ -118,6 +118,18 @@ when it was formed and is still true now, since the goal is still unmet. It neve
 the agent back over work it had rightly moved past. Closing it entirely would mean
 blocking the turn on a model call, which the design refuses for every observer.
 
+One case is loss rather than latency. If the session **ends** while the run is still in
+flight -- a one-shot `pi -p`, or you quit right after the answer -- shutdown aborts the
+run and the verdict is discarded. There is no later `settle` to hold it for, and pi is
+already tearing down, so there is nowhere to report it either.
+
+Measured against a live model, an observer's own call is 1.4-5.5s. That is not slow
+enough to be worth tuning `timeout_ms` over -- the default 20s is nowhere near binding.
+The gap it loses to is the last `turn_end` to `agent_settled`, which is microseconds of
+synchronous work. So on a run with several turns an earlier kick finishes in time and
+the veto lands normally; on a single-round-trip answer there is no earlier kick, and the
+verdict always arrives after the settle it was meant to inform.
+
 #### Known limitation: `skill-recall` advises the next request
 
 `skill-recall` is the one bundled observer that cannot follow the rule above. Its job
