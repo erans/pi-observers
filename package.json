@@ -4,6 +4,15 @@
   "description": "File-defined observer agents for pi: they propose, a reconciler decides.",
   "type": "module",
   "license": "MIT",
+  "author": "Eran Sandler <eran@sandler.co.il>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erans/pi-observers.git"
+  },
+  "homepage": "https://github.com/erans/pi-observers#readme",
+  "bugs": {
+    "url": "https://github.com/erans/pi-observers/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
