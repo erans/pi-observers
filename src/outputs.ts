@@ -9,15 +9,21 @@ export interface ProposalCollector {
 }
 
 /**
- * Matches characters that render as blank: standard whitespace (including
- * U+0085 NEL, which JavaScript's `\s` does NOT match), Unicode format
- * characters (\p{Cf}, e.g. U+200B zero-width space, U+FEFF BOM), and a set of
- * invisible codepoints whose General_Category is NOT Cf so \p{Cf} alone
- * misses them: U+2800 Braille pattern blank, U+115F/U+1160 Hangul fillers,
- * U+17B4/U+17B5 Khmer inherent vowels, U+3164 Hangul filler, U+FFA0
- * halfwidth Hangul filler. The `u` flag is required for \p{...} to work.
+ * Matches characters that render as blank: standard whitespace, Unicode
+ * format characters (\p{Cf}, e.g. U+200B zero-width space, U+FEFF BOM), and
+ * a set of invisible codepoints whose General_Category is NOT Cf so \p{Cf}
+ * alone misses them: U+2800 Braille pattern blank, U+115F/U+1160 Hangul
+ * fillers, U+17B4/U+17B5 Khmer inherent vowels, U+3164 Hangul filler,
+ * U+FFA0 halfwidth Hangul filler. U+0085 (NEL) is listed explicitly
+ * (as the \u0085 escape below) because JavaScript's `\s` does NOT match
+ * it, and its General_Category is Cc (not Cf), so \p{Cf} does not cover
+ * it either -- it would otherwise fall through both guards. The `u` flag
+ * is required for \p{...} to work at all. Every non-ASCII codepoint below
+ * is written as a \uXXXX escape rather than a literal, so the source
+ * stays unambiguous under any transport that might mangle raw invisible
+ * characters.
  */
-const BLANK = /[\s\p{Cf}⠀ᅟᅠ឴឵ㅤﾠ]/gu;
+const BLANK = /[\s\u0085\p{Cf}\u2800\u115F\u1160\u17B4\u17B5\u3164\uFFA0]/gu;
 
 /**
  * Build the output tools for one observer run.

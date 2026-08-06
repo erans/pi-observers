@@ -221,8 +221,10 @@ describe("createOutputTools", () => {
         ["U+17B4 Khmer inherent vowel", "\u17B4"],
         ["empty string", ""],
         ["U+FEFF BOM", "\uFEFF"],
+        ["U+0085 NEL", "\u0085"],
         ["ordinary space", " "],
         ["mixed all-blank string", "\u200B\u2800 \t"],
+        ["mixed all-blank string with NEL", "\u200B\u0085 \t"],
       ];
 
       for (const [label, value] of BLANK_CASES) {
@@ -259,6 +261,12 @@ describe("createOutputTools", () => {
         const { tools, collector } = createOutputTools(defOf());
         await call(tools[0], { advisory: "\u2800ok", fingerprint: "fp" });
         expect(collector.take()?.text).toBe("\u2800ok");
+      });
+
+      it("accepts advisory with a NEL plus real content", async () => {
+        const { tools, collector } = createOutputTools(defOf());
+        await call(tools[0], { advisory: "\u0085x", fingerprint: "fp" });
+        expect(collector.take()?.text).toBe("\u0085x");
       });
 
       it("accepts ordinary text", async () => {
