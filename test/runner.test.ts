@@ -211,9 +211,15 @@ describe("createObserverRunner (exploratory)", () => {
   /**
    * A cwd/agentDir pair seeded with every file pi would otherwise fold into a
    * session: a global SYSTEM.md, a global APPEND_SYSTEM.md, a project context
-   * file and a user skill. Asserting emptiness against a bare /tmp would pass
-   * no matter what the loader was told, so the fixture is what gives the
-   * hermeticity assertions teeth.
+   * file, a user skill, an extension, a prompt template and a theme. Asserting
+   * emptiness against a bare /tmp would pass no matter what the loader was told,
+   * so the fixture is what gives the hermeticity assertions teeth.
+   *
+   * Extensions, prompt templates and themes were the gap in the original fixture:
+   * with nothing seeded for them, `getExtensions().extensions === []` and friends
+   * were vacuously true whether or not `noExtensions`/`noPromptTemplates`/
+   * `noThemes` were even passed. Each one now has a real file that pi's loader
+   * would pick up unless the suppression is doing its job.
    */
   function leakyFixture() {
     const root = mkdtempSync(join(tmpdir(), "pi-observers-runner-"));
@@ -221,12 +227,56 @@ describe("createObserverRunner (exploratory)", () => {
     const agentDir = join(root, "agent");
     mkdirSync(cwd, { recursive: true });
     mkdirSync(join(agentDir, "skills", "leaky"), { recursive: true });
+    mkdirSync(join(agentDir, "extensions"), { recursive: true });
+    mkdirSync(join(agentDir, "prompts"), { recursive: true });
+    mkdirSync(join(agentDir, "themes"), { recursive: true });
     writeFileSync(join(agentDir, "SYSTEM.md"), "GLOBAL-SYSTEM-PROMPT-LEAK\n");
     writeFileSync(join(agentDir, "APPEND_SYSTEM.md"), "GLOBAL-APPEND-LEAK\n");
     writeFileSync(join(cwd, "AGENTS.md"), "PROJECT-CONTEXT-LEAK\n");
     writeFileSync(
       join(agentDir, "skills", "leaky", "SKILL.md"),
       "---\nname: leaky\ndescription: should never reach an observer\n---\n\nbody\n",
+    );
+    writeFileSync(join(agentDir, "extensions", "leaky.js"), "export default function(pi){}\n");
+    writeFileSync(
+      join(agentDir, "prompts", "leaky.md"),
+      "---\nname: leaky-prompt\ndescription: x\n---\nbody\n",
+    );
+    // A full, schema-valid theme (copied from pi's built-in dark.json, renamed):
+    // a theme missing required color tokens fails validation and never reaches
+    // `getThemes().themes` at all, which would make a `noThemes` assertion pass
+    // vacuously the same way the original fixture did for the other three.
+    writeFileSync(
+      join(agentDir, "themes", "leaky.json"),
+      JSON.stringify({
+        name: "leaky-theme",
+        vars: {
+          cyan: "#00d7ff", blue: "#5f87ff", green: "#b5bd68", red: "#cc6666",
+          yellow: "#ffff00", text: "#d4d4d4", gray: "#808080", dimGray: "#666666",
+          darkGray: "#505050", accent: "#8abeb7", selectedBg: "#3a3a4a",
+          userMsgBg: "#343541", toolPendingBg: "#282832", toolSuccessBg: "#283228",
+          toolErrorBg: "#3c2828", customMsgBg: "#2d2838",
+        },
+        colors: {
+          accent: "accent", border: "blue", borderAccent: "cyan", borderMuted: "darkGray",
+          success: "green", error: "red", warning: "yellow", muted: "gray", dim: "dimGray",
+          text: "text", thinkingText: "gray", selectedBg: "selectedBg",
+          userMessageBg: "userMsgBg", userMessageText: "text", customMessageBg: "customMsgBg",
+          customMessageText: "text", customMessageLabel: "#9575cd",
+          toolPendingBg: "toolPendingBg", toolSuccessBg: "toolSuccessBg",
+          toolErrorBg: "toolErrorBg", toolTitle: "text", toolOutput: "gray",
+          mdHeading: "#f0c674", mdLink: "#81a2be", mdLinkUrl: "dimGray", mdCode: "accent",
+          mdCodeBlock: "green", mdCodeBlockBorder: "gray", mdQuote: "gray",
+          mdQuoteBorder: "gray", mdHr: "gray", mdListBullet: "accent",
+          toolDiffAdded: "green", toolDiffRemoved: "red", toolDiffContext: "gray",
+          syntaxComment: "#6A9955", syntaxKeyword: "#569CD6", syntaxFunction: "#DCDCAA",
+          syntaxVariable: "#9CDCFE", syntaxString: "#CE9178", syntaxNumber: "#B5CEA8",
+          syntaxType: "#4EC9B0", syntaxOperator: "#D4D4D4", syntaxPunctuation: "#D4D4D4",
+          thinkingOff: "darkGray", thinkingMinimal: "#6e6e6e", thinkingLow: "#5f87af",
+          thinkingMedium: "#81a2be", thinkingHigh: "#b294bb", thinkingXhigh: "#d183e8",
+          thinkingMax: "#ff5fff", bashMode: "green",
+        },
+      }),
     );
     fixtures.push(root);
     return { cwd, agentDir };
@@ -250,6 +300,17 @@ describe("createObserverRunner (exploratory)", () => {
     expect(loader.getSystemPrompt()).toBe(buildObserverSystemPrompt(defOf()));
     expect(loader.getSystemPrompt()).toContain("read-only");
     expect(loader.getSystemPrompt()).not.toContain("GLOBAL-SYSTEM-PROMPT-LEAK");
+    // Defect guard for the *sibling* mistake: `systemPromptOverride` is a transform
+    // callback over whatever pi discovered on disk, not a replacement. Swapping the
+    // shipped `systemPrompt` option for `systemPromptOverride: () => systemPrompt`
+    // would pass every assertion above (the callback's return value is what
+    // `getSystemPrompt()` reports) while still running `discoverSystemPromptFile()`
+    // against the fixture's real SYSTEM.md — which is exactly the discovery this
+    // hermetic construction exists to suppress. `getSystemPromptSource()` is the
+    // only observable that tells the two apart: it reports the discovered file's
+    // path under the override form, and is undefined under the literal-source form
+    // shipped here.
+    expect(loader.getSystemPromptSource()).toBeUndefined();
   });
 
   it("suppresses append-prompt discovery so no project file leaks in", async () => {
@@ -263,7 +324,7 @@ describe("createObserverRunner (exploratory)", () => {
     expect(h.options().resourceLoader.getAppendSystemPromptSources()).toEqual([]);
   });
 
-  it("loads no extensions, skills, prompts or context files into the nested session", async () => {
+  it("loads no extensions, skills, prompts, themes or context files into the nested session", async () => {
     const h = harness();
     const { cwd, agentDir } = leakyFixture();
     await createObserverRunner({
@@ -274,6 +335,7 @@ describe("createObserverRunner (exploratory)", () => {
     expect(loader.getExtensions().extensions).toEqual([]);
     expect(loader.getSkills().skills).toEqual([]);
     expect(loader.getPrompts().prompts).toEqual([]);
+    expect(loader.getThemes().themes).toEqual([]);
     expect(loader.getAgentsFiles().agentsFiles).toEqual([]);
   });
 
@@ -287,7 +349,11 @@ describe("createObserverRunner (exploratory)", () => {
     expect(opts.thinkingLevel).toBe("medium");
     // biome-ignore lint/suspicious/noExplicitAny: fake tool invocation
     expect(opts.customTools.map((t: any) => t.name).sort()).toEqual(["propose", "veto"]);
+    // A real `SessionManager.create(cwd)` would also satisfy `toBeDefined()` and would
+    // write observer transcripts into the user's own session store. `isPersisted()` is
+    // the one observable that tells `create()` and `inMemory()` apart.
     expect(opts.sessionManager).toBeDefined();
+    expect(opts.sessionManager.isPersisted()).toBe(false);
   });
 
   it("names itself after the definition", async () => {
@@ -310,6 +376,20 @@ describe("createObserverRunner (exploratory)", () => {
     const runner = await build(h, { sees: [] });
     await runner.run({ lastUserMessage: "ignored" }, new AbortController().signal);
     expect(h.prompts[0]).toBe("Observe now.");
+  });
+
+  it("disables prompt-template/skill/extension-command expansion on every prompt call", async () => {
+    // Untrusted slice content lands in this text. pi only expands prompt templates,
+    // skill commands and extension commands when the text starts with "/" AND
+    // expandPromptTemplates is not false — the wake text here never starts with "/",
+    // but that must not be the only thing preventing expansion: a future edit to the
+    // "Observe now." prefix must not silently reopen this path.
+    const h = harness();
+    const runner = await build(h);
+    await runner.run({ lastUserMessage: "a" }, new AbortController().signal);
+    // biome-ignore lint/suspicious/noExplicitAny: fake tool invocation
+    const call = (h.session.prompt as any).mock.calls[0];
+    expect(call[1]).toMatchObject({ expandPromptTemplates: false });
   });
 
   it("passes each run's own state, not the first run's", async () => {
@@ -426,6 +506,24 @@ describe("createObserverRunner (exploratory)", () => {
     runner.dispose();
     expect(await runner.run({ lastUserMessage: "a" }, new AbortController().signal)).toBeNull();
     expect(h.session.prompt).toHaveBeenCalledTimes(0);
+  });
+
+  it("aborts a run that is still in flight when dispose is called", async () => {
+    // Without this, a run started before dispose() keeps prompting a session that
+    // dispose() has already torn down.
+    let release: () => void = () => {};
+    const h = harness(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const runner = await build(h);
+    const pending = runner.run({}, new AbortController().signal);
+    runner.dispose();
+    expect(h.session.abort).toHaveBeenCalledTimes(1);
+    release();
+    await pending;
   });
 
   it("refuses overlapping runs rather than crossing their collectors", async () => {

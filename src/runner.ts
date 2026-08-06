@@ -21,7 +21,7 @@ export interface ObserverRunner {
  * fake owes us. The real `createAgentSession` satisfies it structurally.
  */
 interface ObserverSession {
-  prompt(text: string): Promise<void>;
+  prompt(text: string, options?: { expandPromptTemplates?: boolean }): Promise<void>;
   abort(): Promise<void>;
   dispose(): void;
 }
@@ -144,9 +144,21 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
       if (disposed) return null;
       if (signal.aborted) return null;
       // One collector serves every run, so two overlapping runs would misattribute
-      // one run's proposal to the other. The bus already serialises per observer;
-      // failing loudly keeps that guarantee from eroding unnoticed.
-      if (running) throw new Error(`Observer ${def.name} is already running.`);
+      // one run's proposal to the other. This IS reachable in production: ProposalBus
+      // races each run against a timeout and clears its own `inflight` slot in a
+      // `.finally()` that fires the instant the timeout wins — independently of
+      // whether the underlying session.prompt() has actually returned. A wedged run
+      // therefore leaves `running` true here long after the bus is willing to issue
+      // the next kick. Failing loudly turns that wedge into three counted failures
+      // (and a disabled observer) instead of a crossed or lost proposal.
+      if (running) {
+        throw new Error(
+          `Observer ${def.name} is already running: a previous run has not finished ` +
+            "(it may be wedged past its own timeout, which releases the bus's slot " +
+            "without stopping the underlying prompt) rather than this call being a " +
+            "caller error.",
+        );
+      }
       running = true;
 
       collector.reset();
@@ -165,7 +177,16 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
       };
       signal.addEventListener("abort", onAbort, { once: true });
       try {
-        await session.prompt(prompt);
+        // Untrusted slice content is folded into `prompt` above. pi's prompt-template,
+        // skill-command and extension-command expansion is already starved of
+        // anything to expand into (noExtensions/noSkills/noPromptTemplates above leave
+        // the resourceLoader empty), and separately gated on the text starting with
+        // "/" — which our wake text never does, only because it happens to start
+        // "Observe now.". Passing expandPromptTemplates: false makes the injection
+        // safety structural instead of resting on either of those: expansion cannot
+        // run here even if a future change repopulated the loader or changed the
+        // wake prefix.
+        await session.prompt(prompt, { expandPromptTemplates: false });
       } finally {
         // Always remove it: the session outlives the run, and a listener per run
         // would accumulate for the life of the session.
@@ -179,6 +200,11 @@ export async function createObserverRunner(opts: CreateRunnerOptions): Promise<O
     dispose() {
       if (disposed) return;
       disposed = true;
+      // A run started before dispose() owns no signal telling it to stop; without
+      // this, it would keep prompting a session we are about to tear down. Fire
+      // and forget, like the abort bridge above: a failed abort must not surface
+      // as an unhandled rejection, and dispose() itself is synchronous.
+      if (running) void session.abort().catch(() => {});
       session.dispose();
     },
   };
