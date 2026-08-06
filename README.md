@@ -26,9 +26,27 @@ Or load directly for development:
 
 ## Writing an observer
 
-Drop a markdown file in `.pi/observers/` (project) or `~/.pi/agent/observers/`
-(global). Same-named files override the bundled ones; project beats global beats
-bundled.
+Drop a markdown file in `.pi/observers/`. Definitions are read from three directories,
+lowest precedence first:
+
+| Layer | Directory | Loaded |
+|---|---|---|
+| bundled | this package's `observers/` | always |
+| user | `<agent dir>/observers/` -- `~/.pi/agent/observers/` unless you moved it | always |
+| project | `.pi/observers/` in the working directory | **only when the project is trusted** |
+
+A later layer beats an earlier one, so a project definition wins over a user one, which
+wins over a bundled one. **Precedence keys on the `name:` field, not the filename** --
+to replace the shipped `goal-tracker`, give any file you like `name: goal-tracker` and
+yours is used in its place, entirely: prompt, trigger, model, permissions. Overriding
+one observer never disturbs the others.
+
+Layers are additive, not exclusive. A bundled observer you have not overridden still
+loads -- there is no "use only mine" switch. To run only your own, name the ones you do
+not want in `disable` (see Settings).
+
+See [Trust](#trust) for why the project layer is gated and what you see when it is
+skipped.
 
     ---
     name: my-observer
