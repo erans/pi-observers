@@ -54,7 +54,29 @@ export class Reconciler {
 
     const byPriority = (a: Proposal, b: Proposal) => b.priority - a.priority;
 
-    const advisories = fresh.filter((x) => x.kind === "advisory").sort(byPriority);
+    // Collapse same-fingerprint advisories within this single batch, keeping only the
+    // highest-priority one (earlier wins on a tie, for determinism). This runs after the
+    // accepted-fingerprint filter above and before the priority cap below, so a duplicate
+    // never occupies a slot that a distinct advisory could have used.
+    const freshAdvisories = fresh.filter((x) => x.kind === "advisory");
+    const bestByFingerprint = new Map<string, Proposal>();
+    for (const proposal of freshAdvisories) {
+      const current = bestByFingerprint.get(proposal.fingerprint);
+      if (!current || proposal.priority > current.priority) {
+        bestByFingerprint.set(proposal.fingerprint, proposal);
+      }
+    }
+    const survivors = new Set(bestByFingerprint.values());
+    for (const proposal of freshAdvisories) {
+      if (!survivors.has(proposal)) {
+        dropped.push({
+          proposal,
+          reason: "duplicate fingerprint within this batch; a higher-priority advisory with the same fingerprint was kept",
+        });
+      }
+    }
+
+    const advisories = [...survivors].sort(byPriority);
     const kept = advisories.slice(0, this.#maxAdvisories);
     for (const proposal of advisories.slice(this.#maxAdvisories)) {
       dropped.push({ proposal, reason: "over the per-turn advisory budget" });

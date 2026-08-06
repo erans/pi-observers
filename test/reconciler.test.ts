@@ -270,4 +270,92 @@ describe("Reconciler", () => {
       expect(turn3.dropped.some((d) => d.reason.match(/already/i))).toBe(true);
     });
   });
+
+  describe("Exploratory: same-fingerprint advisory collapsing within a single batch", () => {
+    it("collapses two same-fingerprint advisories in one call, keeping the higher priority", () => {
+      const r = new Reconciler();
+      const out = r.reconcile([
+        p({ fingerprint: "dup", priority: 10, text: "low" }),
+        p({ fingerprint: "dup", priority: 90, text: "high" }),
+      ]);
+      expect(out.advisories).toHaveLength(1);
+      expect(out.advisories[0]?.text).toBe("high");
+      expect(out.dropped).toHaveLength(1);
+      expect(out.dropped[0]?.proposal.text).toBe("low");
+      expect(out.dropped[0]?.reason).toMatch(/duplicate/i);
+    });
+
+    it("with equal priority, keeps the earlier one deterministically", () => {
+      const r = new Reconciler();
+      const out = r.reconcile([
+        p({ fingerprint: "dup", priority: 50, text: "first" }),
+        p({ fingerprint: "dup", priority: 50, text: "second" }),
+      ]);
+      expect(out.advisories).toHaveLength(1);
+      expect(out.advisories[0]?.text).toBe("first");
+      expect(out.dropped).toHaveLength(1);
+      expect(out.dropped[0]?.proposal.text).toBe("second");
+    });
+
+    it("a collapsed duplicate does not consume a per-turn slot", () => {
+      const r = new Reconciler({ maxAdvisoriesPerTurn: 2 });
+      const out = r.reconcile([
+        p({ fingerprint: "a", priority: 50, text: "dupA-1" }),
+        p({ fingerprint: "a", priority: 50, text: "dupA-2" }),
+        p({ fingerprint: "b", priority: 10, text: "distinctB" }),
+      ]);
+      expect(out.advisories.map((x) => x.fingerprint)).toEqual(["a", "b"]);
+      expect(out.dropped.map((d) => d.proposal.text)).toEqual(["dupA-2"]);
+    });
+
+    it("does not leak into the accepted set if the survivor is itself dropped by the priority cap", () => {
+      const r = new Reconciler({ maxAdvisoriesPerTurn: 1 });
+      const turn1 = r.reconcile([
+        p({ fingerprint: "high", priority: 90 }),
+        p({ fingerprint: "dup", priority: 10, text: "dup-low" }),
+        p({ fingerprint: "dup", priority: 5, text: "dup-lower" }),
+      ]);
+      expect(turn1.advisories.map((a) => a.fingerprint)).toEqual(["high"]);
+      // "dup" survivor (priority 10) lost to the per-turn cap, not to collapsing,
+      // so it must remain eligible next turn.
+      expect(r.accepted()).toEqual(["high"]);
+
+      const turn2 = r.reconcile([p({ fingerprint: "dup", priority: 10, text: "dup-low" })]);
+      expect(turn2.advisories.map((a) => a.fingerprint)).toEqual(["dup"]);
+      expect(turn2.dropped).toHaveLength(0);
+    });
+
+    it("two vetoes sharing a fingerprint are not collapsed; budget alone governs them", () => {
+      const r = new Reconciler({ vetoBudget: 2 });
+      const out = r.reconcile([
+        p({ kind: "veto", fingerprint: "v", priority: 10, text: "veto-low" }),
+        p({ kind: "veto", fingerprint: "v", priority: 90, text: "veto-high" }),
+      ]);
+      // Only one veto can be selected per turn (the higher priority one), but this is the
+      // existing "at most one veto per turn" rule, not fingerprint collapsing — the lower
+      // one is dropped for that reason, not as a "duplicate".
+      expect(out.veto?.text).toBe("veto-high");
+      expect(out.dropped).toHaveLength(1);
+      expect(out.dropped[0]?.reason).not.toMatch(/duplicate/i);
+      expect(out.dropped[0]?.reason).toMatch(/another veto/i);
+
+      // Budget still allows the same fingerprint to veto again on a later turn.
+      const out2 = r.reconcile([p({ kind: "veto", fingerprint: "v", priority: 50 })]);
+      expect(out2.veto?.fingerprint).toBe("v");
+    });
+
+    it("an advisory and a veto sharing a fingerprint still do not interfere in either direction", () => {
+      const r = new Reconciler({ maxAdvisoriesPerTurn: 2, vetoBudget: 2 });
+      const out = r.reconcile([
+        p({ kind: "advisory", fingerprint: "shared", priority: 50, text: "advisory" }),
+        p({ kind: "veto", fingerprint: "shared", priority: 60, text: "veto" }),
+      ]);
+      expect(out.veto?.kind).toBe("veto");
+      expect(out.veto?.fingerprint).toBe("shared");
+      expect(out.advisories).toHaveLength(1);
+      expect(out.advisories[0]?.kind).toBe("advisory");
+      expect(out.advisories[0]?.fingerprint).toBe("shared");
+      expect(out.dropped).toHaveLength(0);
+    });
+  });
 });
