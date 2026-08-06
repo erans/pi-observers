@@ -4,15 +4,30 @@ import type { ObserverDefinition } from "../src/types.ts";
 
 function defOf(over: Partial<ObserverDefinition> = {}): ObserverDefinition {
   return {
-    name: "o", description: "d", enabled: true, on: "turn_end", sees: [], tools: [],
-    can: ["advise"], deliver: "next_prompt", fallback: [], thinking: "low", priority: 70,
-    maxAdvisoryChars: 20, timeoutMs: 20000, systemPrompt: "b", sourcePath: "/o.md",
-    scope: "builtin", ...over,
+    name: "o",
+    description: "d",
+    enabled: true,
+    on: "turn_end",
+    sees: [],
+    tools: [],
+    can: ["advise"],
+    deliver: "next_prompt",
+    fallback: [],
+    thinking: "low",
+    priority: 70,
+    maxAdvisoryChars: 20,
+    timeoutMs: 20000,
+    systemPrompt: "b",
+    sourcePath: "/o.md",
+    scope: "builtin",
+    ...over,
   };
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: test harness for the tool execute signature
-const call = (tool: any, params: unknown) => tool.execute("id", params, undefined, undefined, {} as any);
+const call = (tool: any, params: unknown) =>
+  // biome-ignore lint/suspicious/noExplicitAny: test harness for the tool execute signature
+  tool.execute("id", params, undefined, undefined, {} as any);
 
 describe("createOutputTools", () => {
   it("registers only propose when can is [advise]", () => {
@@ -29,8 +44,12 @@ describe("createOutputTools", () => {
     const { tools, collector } = createOutputTools(defOf({ deliver: "settle", priority: 70 }));
     await call(tools[0], { advisory: "check the tests", fingerprint: "fp1" });
     expect(collector.take()).toEqual({
-      observer: "o", kind: "advisory", text: "check the tests",
-      fingerprint: "fp1", priority: 70, deliver: "settle",
+      observer: "o",
+      kind: "advisory",
+      text: "check the tests",
+      fingerprint: "fp1",
+      priority: 70,
+      deliver: "settle",
     });
   });
 
@@ -86,6 +105,7 @@ describe("createOutputTools", () => {
     it("allows veto to be emitted by observer with veto capability but not advise", async () => {
       const { tools, collector } = createOutputTools(defOf({ can: ["veto"] }));
       expect(tools).toHaveLength(1);
+      // biome-ignore lint/style/noNonNullAssertion: presence just asserted above via toHaveLength(1)
       const vetoTool = tools[0]!;
       expect(vetoTool.name).toBe("veto");
       await call(vetoTool, { reason: "incomplete", fingerprint: "v1" });
@@ -102,9 +122,9 @@ describe("createOutputTools", () => {
     it("veto also respects max_advisory_chars", async () => {
       const { tools } = createOutputTools(defOf({ can: ["veto"], maxAdvisoryChars: 5 }));
       const vetoTool = tools[0];
-      await expect(
-        call(vetoTool, { reason: "toolong", fingerprint: "v1" })
-      ).rejects.toThrow(/exceeds max_advisory_chars/);
+      await expect(call(vetoTool, { reason: "toolong", fingerprint: "v1" })).rejects.toThrow(
+        /exceeds max_advisory_chars/,
+      );
     });
 
     // Input validation tests
@@ -125,6 +145,7 @@ describe("createOutputTools", () => {
 
       it("throws when veto reason is empty string", async () => {
         const { tools } = createOutputTools(defOf({ can: ["veto"] }));
+        // biome-ignore lint/style/noNonNullAssertion: defOf({ can: ["veto"] }) guarantees createOutputTools registers a veto tool
         const vetoTool = tools.find((t) => t.name === "veto")!;
         await expect(call(vetoTool, { reason: "", fingerprint: "fp" })).rejects.toThrow(
           /Reason must be a non-empty string/,
@@ -133,6 +154,7 @@ describe("createOutputTools", () => {
 
       it("throws when veto reason is whitespace-only", async () => {
         const { tools } = createOutputTools(defOf({ can: ["veto"] }));
+        // biome-ignore lint/style/noNonNullAssertion: defOf({ can: ["veto"] }) guarantees createOutputTools registers a veto tool
         const vetoTool = tools.find((t) => t.name === "veto")!;
         await expect(call(vetoTool, { reason: "  \n  ", fingerprint: "fp" })).rejects.toThrow(
           /Reason must be a non-empty string/,
@@ -177,6 +199,7 @@ describe("createOutputTools", () => {
           deliver: "settle",
           observer: "malicious",
           kind: "veto",
+          // biome-ignore lint/suspicious/noExplicitAny: deliberately spoofing extra call-site fields to prove the tool ignores them
         } as any);
         const proposal = collector.take();
         expect(proposal).toMatchObject({
@@ -189,6 +212,7 @@ describe("createOutputTools", () => {
 
       it("observer cannot spoof priority in veto call", async () => {
         const { tools, collector } = createOutputTools(defOf({ can: ["veto"], priority: 75 }));
+        // biome-ignore lint/style/noNonNullAssertion: defOf({ can: ["veto"] }) guarantees createOutputTools registers a veto tool
         const vetoTool = tools.find((t) => t.name === "veto")!;
         // Try to pass a spoofed priority field (and other fields)
         await call(vetoTool, {
@@ -198,6 +222,7 @@ describe("createOutputTools", () => {
           deliver: "settle",
           observer: "malicious",
           kind: "advisory",
+          // biome-ignore lint/suspicious/noExplicitAny: deliberately spoofing extra call-site fields to prove the tool ignores them
         } as any);
         const proposal = collector.take();
         expect(proposal).toMatchObject({
@@ -237,6 +262,7 @@ describe("createOutputTools", () => {
 
         it(`rejects veto reason containing only blank codepoints: ${label}`, async () => {
           const { tools } = createOutputTools(defOf({ can: ["veto"] }));
+          // biome-ignore lint/style/noNonNullAssertion: defOf({ can: ["veto"] }) guarantees createOutputTools registers a veto tool
           const vetoTool = tools.find((t) => t.name === "veto")!;
           await expect(call(vetoTool, { reason: value, fingerprint: "fp" })).rejects.toThrow(
             /Reason must be a non-empty string/,
@@ -245,9 +271,9 @@ describe("createOutputTools", () => {
 
         it(`rejects fingerprint containing only blank codepoints: ${label}`, async () => {
           const { tools } = createOutputTools(defOf());
-          await expect(call(tools[0], { advisory: "valid text", fingerprint: value })).rejects.toThrow(
-            /Fingerprint must be a non-empty string/,
-          );
+          await expect(
+            call(tools[0], { advisory: "valid text", fingerprint: value }),
+          ).rejects.toThrow(/Fingerprint must be a non-empty string/);
         });
       }
 

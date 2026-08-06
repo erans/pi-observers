@@ -46,21 +46,32 @@ export function parseSettings(raw: unknown): ObserverSettings {
     unknown
   >;
   const defaultModel =
-    typeof obj.defaultModel === "string" && obj.defaultModel.trim() !== "" ? obj.defaultModel.trim() : undefined;
+    typeof obj.defaultModel === "string" && obj.defaultModel.trim() !== ""
+      ? obj.defaultModel.trim()
+      : undefined;
 
   return {
     enabled: booleanOr(obj.enabled, true),
-    maxAdvisoriesPerTurn: positiveIntOr(obj.maxAdvisoriesPerTurn, DEFAULTS.maxAdvisoriesPerTurn, MAX_ADVISORIES_LIMIT),
+    maxAdvisoriesPerTurn: positiveIntOr(
+      obj.maxAdvisoriesPerTurn,
+      DEFAULTS.maxAdvisoriesPerTurn,
+      MAX_ADVISORIES_LIMIT,
+    ),
     vetoBudget: positiveIntOr(obj.vetoBudget, DEFAULTS.vetoBudget, MAX_VETO_BUDGET_LIMIT),
     defaultModel,
     disable: Array.isArray(obj.disable)
-      ? obj.disable.filter((n): n is string => typeof n === "string" && n.trim() !== "").map((n) => n.trim())
+      ? obj.disable
+          .filter((n): n is string => typeof n === "string" && n.trim() !== "")
+          .map((n) => n.trim())
       : [],
   };
 }
 
 /** Either switch being off means off. */
-export function isObserverEnabled(def: { name: string; enabled: boolean }, settings: ObserverSettings): boolean {
+export function isObserverEnabled(
+  def: { name: string; enabled: boolean },
+  settings: ObserverSettings,
+): boolean {
   if (!settings.enabled) return false;
   if (!def.enabled) return false;
   return !settings.disable.includes(def.name);

@@ -72,7 +72,10 @@ describe("parseSettings", () => {
   });
 
   it("drops non-string and blank entries from disable", () => {
-    expect(parseSettings({ disable: ["a", "", "  ", null, 7, {}, " b "] }).disable).toEqual(["a", "b"]);
+    expect(parseSettings({ disable: ["a", "", "  ", null, 7, {}, " b "] }).disable).toEqual([
+      "a",
+      "b",
+    ]);
   });
 
   // --- Exploratory: null vs undefined vs missing ---
@@ -115,7 +118,9 @@ describe("parseSettings", () => {
 
   it("rejects NaN, Infinity, and non-numeric strings for counts", () => {
     expect(parseSettings({ maxAdvisoriesPerTurn: Number.NaN }).maxAdvisoriesPerTurn).toBe(2);
-    expect(parseSettings({ maxAdvisoriesPerTurn: Number.POSITIVE_INFINITY }).maxAdvisoriesPerTurn).toBe(2);
+    expect(
+      parseSettings({ maxAdvisoriesPerTurn: Number.POSITIVE_INFINITY }).maxAdvisoriesPerTurn,
+    ).toBe(2);
     expect(parseSettings({ maxAdvisoriesPerTurn: "abc" }).maxAdvisoriesPerTurn).toBe(2);
     expect(parseSettings({ maxAdvisoriesPerTurn: "" }).maxAdvisoriesPerTurn).toBe(2);
     expect(parseSettings({ maxAdvisoriesPerTurn: "  " }).maxAdvisoriesPerTurn).toBe(2);
@@ -165,7 +170,7 @@ describe("parseSettings", () => {
     // (e.g. `{...obj}`) and thereby carries that own property into the returned object.
     const payload = JSON.parse('{"__proto__": {"polluted": true}, "enabled": true}');
     const s = parseSettings(payload);
-    expect(Object.prototype.hasOwnProperty.call(s, "__proto__")).toBe(false);
+    expect(Object.hasOwn(s, "__proto__")).toBe(false);
     expect(JSON.stringify(s)).not.toContain("polluted");
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     expect(s.enabled).toBe(true);

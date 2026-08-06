@@ -37,9 +37,11 @@ export function normalizeModelId(id: string): string {
   const lower = id.toLowerCase().replace(/\./g, "-");
   // Only strip a suffix if it parses as a valid date: YYYYMMDD where
   // YYYY is 2000-2999, MM is 01-12, DD is 01-31
-  const dateMatch = lower.match(/-(?:20|21|22|23|24|25|26|27|28|29)(\d{2})(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$/);
+  const dateMatch = lower.match(
+    /-(?:20|21|22|23|24|25|26|27|28|29)(\d{2})(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$/,
+  );
   if (dateMatch) {
-    return lower.slice(0, -(dateMatch[0].length));
+    return lower.slice(0, -dateMatch[0].length);
   }
   return lower;
 }
@@ -51,7 +53,10 @@ function splitRef(ref: string): { provider?: string; id: string } {
 }
 
 /** Steps 1-3 for a single model reference. */
-function resolveRef(ref: string, lookup: ModelLookup): { model: ModelLike; via: ResolutionStep } | undefined {
+function resolveRef(
+  ref: string,
+  lookup: ModelLookup,
+): { model: ModelLike; via: ResolutionStep } | undefined {
   const { provider, id } = splitRef(ref);
   if (!id) return undefined;
 

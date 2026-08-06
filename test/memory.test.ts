@@ -122,7 +122,7 @@ describe("deriveSlug — non-Latin", () => {
 
 describe("deriveDescription — truncation safety", () => {
   it("does not split a surrogate pair at the cap", () => {
-    const d = deriveDescription("x".repeat(98) + "\u{1F600}" + "y".repeat(50));
+    const d = deriveDescription(`${"x".repeat(98)}\u{1F600}${"y".repeat(50)}`);
     expect(d).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
     expect(d).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   });

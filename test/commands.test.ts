@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -51,7 +51,16 @@ describe("formatObserverStatus", () => {
         accepted: 2,
         dropped: 1,
       },
-      { name: "verification", enabled: false, model: "-", runs: 0, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      {
+        name: "verification",
+        enabled: false,
+        model: "-",
+        runs: 0,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     expect(out).toContain("memory-recall");
     expect(out).toContain("lunaroute/deepseek-v4-flash");
@@ -63,7 +72,16 @@ describe("formatObserverStatus", () => {
     // An observer that runs constantly and has everything dropped is working and
     // useless; with only a run count it looks identical to a healthy one.
     const out = formatObserverStatus([
-      { name: "noisy", enabled: true, model: "m", runs: 9, failures: 0, disabled: false, accepted: 0, dropped: 9 },
+      {
+        name: "noisy",
+        enabled: true,
+        model: "m",
+        runs: 9,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 9,
+      },
     ]);
     expect(out).toMatch(/0 accepted/);
     expect(out).toMatch(/9 dropped/);
@@ -72,14 +90,32 @@ describe("formatObserverStatus", () => {
   it("shows failures for an observer that is failing but not yet disabled", () => {
     // Reporting failures only after the disable threshold hides the warning signal.
     const out = formatObserverStatus([
-      { name: "shaky", enabled: true, model: "m", runs: 5, failures: 2, disabled: false, accepted: 1, dropped: 0 },
+      {
+        name: "shaky",
+        enabled: true,
+        model: "m",
+        runs: 5,
+        failures: 2,
+        disabled: false,
+        accepted: 1,
+        dropped: 0,
+      },
     ]);
     expect(out).toMatch(/2 failures/);
   });
 
   it("flags an observer disabled by repeated failures", () => {
     const out = formatObserverStatus([
-      { name: "flaky", enabled: true, model: "m", runs: 3, failures: 3, disabled: true, accepted: 0, dropped: 0 },
+      {
+        name: "flaky",
+        enabled: true,
+        model: "m",
+        runs: 3,
+        failures: 3,
+        disabled: true,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     expect(out).toMatch(/failure/i);
   });
@@ -173,7 +209,16 @@ describe("goalFilePath", () => {
 describe("formatObserverStatus — exploratory", () => {
   it("reports zero runs explicitly rather than omitting the observer's counts", () => {
     const out = formatObserverStatus([
-      { name: "fresh", enabled: true, model: "m", runs: 0, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      {
+        name: "fresh",
+        enabled: true,
+        model: "m",
+        runs: 0,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     expect(out).toMatch(/0 runs/);
     expect(out).toMatch(/0 accepted/);
@@ -185,7 +230,16 @@ describe("formatObserverStatus — exploratory", () => {
     // the session, before it started failing. That history must not disappear once the
     // observer trips the disable threshold.
     const out = formatObserverStatus([
-      { name: "was-good", enabled: true, model: "m", runs: 10, failures: 3, disabled: true, accepted: 5, dropped: 2 },
+      {
+        name: "was-good",
+        enabled: true,
+        model: "m",
+        runs: 10,
+        failures: 3,
+        disabled: true,
+        accepted: 5,
+        dropped: 2,
+      },
     ]);
     expect(out).toMatch(/5 accepted/);
     expect(out).toMatch(/2 dropped/);
@@ -194,19 +248,48 @@ describe("formatObserverStatus — exploratory", () => {
   it("reports the real counts even when the observer's name itself looks like a count", () => {
     // Guards against an assertion (or an implementation) that merely checks the
     // substring "3 accepted" is present, which a name like this would satisfy by
-        // accident even if the actual accepted count were wrong.
+    // accident even if the actual accepted count were wrong.
     const out = formatObserverStatus([
-      { name: "0 accepted 9 dropped", enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 3, dropped: 4 },
+      {
+        name: "0 accepted 9 dropped",
+        enabled: true,
+        model: "m",
+        runs: 1,
+        failures: 0,
+        disabled: false,
+        accepted: 3,
+        dropped: 4,
+      },
     ]);
-    const afterName = out.slice(out.indexOf("0 accepted 9 dropped") + "0 accepted 9 dropped".length);
+    const afterName = out.slice(
+      out.indexOf("0 accepted 9 dropped") + "0 accepted 9 dropped".length,
+    );
     expect(afterName).toMatch(/3 accepted/);
     expect(afterName).toMatch(/4 dropped/);
   });
 
   it("keeps rows on separate lines and names intact when a name carries bracket characters", () => {
     const out = formatObserverStatus([
-      { name: "weird[name]", enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 1, dropped: 0 },
-      { name: "second-observer", enabled: false, model: "-", runs: 0, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      {
+        name: "weird[name]",
+        enabled: true,
+        model: "m",
+        runs: 1,
+        failures: 0,
+        disabled: false,
+        accepted: 1,
+        dropped: 0,
+      },
+      {
+        name: "second-observer",
+        enabled: false,
+        model: "-",
+        runs: 0,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     const lines = out.split("\n");
     expect(lines).toHaveLength(2);
@@ -216,7 +299,16 @@ describe("formatObserverStatus — exploratory", () => {
 
   it("singularizes run/failure counts of exactly 1", () => {
     const out = formatObserverStatus([
-      { name: "solo", enabled: true, model: "m", runs: 1, failures: 1, disabled: false, accepted: 0, dropped: 0 },
+      {
+        name: "solo",
+        enabled: true,
+        model: "m",
+        runs: 1,
+        failures: 1,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     expect(out).toMatch(/\b1 run\b/);
     expect(out).not.toMatch(/\b1 runs\b/);
@@ -254,7 +346,16 @@ describe("writeGoal — ordinary overwrite does not delete first", () => {
 describe("formatObserverStatus — failure gating", () => {
   it("does not report zero failures for a healthy, non-disabled observer", () => {
     const out = formatObserverStatus([
-      { name: "healthy", enabled: true, model: "m", runs: 5, failures: 0, disabled: false, accepted: 2, dropped: 0 },
+      {
+        name: "healthy",
+        enabled: true,
+        model: "m",
+        runs: 5,
+        failures: 0,
+        disabled: false,
+        accepted: 2,
+        dropped: 0,
+      },
     ]);
     expect(out).not.toMatch(/0 failures?/);
   });
@@ -263,7 +364,16 @@ describe("formatObserverStatus — failure gating", () => {
     // The count already appears once in the state label ("disabled after 3 failures");
     // it must not also appear a second time in the trailing parts list.
     const out = formatObserverStatus([
-      { name: "flaky", enabled: true, model: "m", runs: 3, failures: 3, disabled: true, accepted: 0, dropped: 0 },
+      {
+        name: "flaky",
+        enabled: true,
+        model: "m",
+        runs: 3,
+        failures: 3,
+        disabled: true,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     const occurrences = out.match(/3 failures?/g) ?? [];
     expect(occurrences).toHaveLength(1);
@@ -292,8 +402,26 @@ describe("formatObserverStatus — row forgery via name/model", () => {
     it(`collapses a ${label} inside a name so N rows always produce N lines`, () => {
       const forgedName = `evil${sep}forged-row [disabled after 99 failures] fake-model`;
       const out = formatObserverStatus([
-        { name: forgedName, enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
-        { name: "second-observer", enabled: false, model: "-", runs: 0, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+        {
+          name: forgedName,
+          enabled: true,
+          model: "m",
+          runs: 1,
+          failures: 0,
+          disabled: false,
+          accepted: 0,
+          dropped: 0,
+        },
+        {
+          name: "second-observer",
+          enabled: false,
+          model: "-",
+          runs: 0,
+          failures: 0,
+          disabled: false,
+          accepted: 0,
+          dropped: 0,
+        },
       ]);
       expect(out.split("\n")).toHaveLength(2);
       // `.split("\n")` alone only catches LF/CRLF — a raw CR, NEL, VT, FF, LS, or PS
@@ -311,10 +439,20 @@ describe("formatObserverStatus — row forgery via name/model", () => {
 
   it("caps an extremely long name so one row cannot dominate the output", () => {
     const out = formatObserverStatus([
-      { name: "x".repeat(10_000), enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      {
+        name: "x".repeat(10_000),
+        enabled: true,
+        model: "m",
+        runs: 1,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     const lines = out.split("\n");
     expect(lines).toHaveLength(1);
+    // biome-ignore lint/style/noNonNullAssertion: length just asserted above via toHaveLength(1)
     expect(lines[0]!.length).toBeLessThan(300);
   });
 });
@@ -326,8 +464,26 @@ describe("formatObserverStatus — row forgery via model (R2-1)", () => {
   it("collapses a NEL inside a model so N rows always produce N lines", () => {
     const forgedModel = "evil" + "\u0085" + "forged-row [disabled after 99 failures] fake-name";
     const out = formatObserverStatus([
-      { name: "n1", enabled: true, model: forgedModel, runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
-      { name: "n2", enabled: false, model: "-", runs: 0, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      {
+        name: "n1",
+        enabled: true,
+        model: forgedModel,
+        runs: 1,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
+      {
+        name: "n2",
+        enabled: false,
+        model: "-",
+        runs: 0,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     expect(out.split("\n")).toHaveLength(2);
     expect(out).not.toContain("\u0085");
@@ -335,10 +491,20 @@ describe("formatObserverStatus — row forgery via model (R2-1)", () => {
 
   it("caps an extremely long model so one row cannot dominate the output", () => {
     const out = formatObserverStatus([
-      { name: "n", enabled: true, model: "x".repeat(10_000), runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      {
+        name: "n",
+        enabled: true,
+        model: "x".repeat(10_000),
+        runs: 1,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     const lines = out.split("\n");
     expect(lines).toHaveLength(1);
+    // biome-ignore lint/style/noNonNullAssertion: length just asserted above via toHaveLength(1)
     expect(lines[0]!.length).toBeLessThan(300);
   });
 });
@@ -357,7 +523,16 @@ describe("formatObserverStatus — truncation is code-point safe (R2-2)", () => 
     (pad) => {
       const name = "z".repeat(pad) + EMOJI;
       const out = formatObserverStatus([
-        { name, enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+        {
+          name,
+          enabled: true,
+          model: "m",
+          runs: 1,
+          failures: 0,
+          disabled: false,
+          accepted: 0,
+          dropped: 0,
+        },
       ]);
       expect(LONE_HIGH_SURROGATE.test(out)).toBe(false);
       expect(LONE_LOW_SURROGATE.test(out)).toBe(false);
@@ -367,7 +542,16 @@ describe("formatObserverStatus — truncation is code-point safe (R2-2)", () => 
   it("keeps a whole trailing emoji that fits exactly at the cap, rather than splitting it", () => {
     const name = "z".repeat(CAP - 1) + EMOJI;
     const out = formatObserverStatus([
-      { name, enabled: true, model: "m", runs: 1, failures: 0, disabled: false, accepted: 0, dropped: 0 },
+      {
+        name,
+        enabled: true,
+        model: "m",
+        runs: 1,
+        failures: 0,
+        disabled: false,
+        accepted: 0,
+        dropped: 0,
+      },
     ]);
     expect(out).toContain(EMOJI);
   });

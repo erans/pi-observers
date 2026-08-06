@@ -1,19 +1,19 @@
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import {
   ALLOWED_TOOLS,
+  type AllowedTool,
   CAPABILITIES,
+  type Capability,
   DEFAULTS,
   DELIVERY_POINTS,
-  SLICE_NAMES,
-  TRIGGER_EVENTS,
-  isAllowedTool,
-  type AllowedTool,
-  type Capability,
   type DeliveryPoint,
+  isAllowedTool,
   type ObserverDefinition,
   type ObserverScope,
+  SLICE_NAMES,
   type SliceName,
   type ThinkingLevel,
+  TRIGGER_EVENTS,
   type TriggerEvent,
 } from "./types.ts";
 
@@ -121,7 +121,11 @@ function manyOf<T extends string>(
   if (list === undefined) return fallbackValue;
   for (const item of list) {
     if (!(allowed as readonly string[]).includes(item)) {
-      fail(file, key, `"${item}" is not a valid ${key} entry. Expected one of: ${allowed.join(", ")}.`);
+      fail(
+        file,
+        key,
+        `"${item}" is not a valid ${key} entry. Expected one of: ${allowed.join(", ")}.`,
+      );
     }
   }
   return list as T[];
@@ -145,7 +149,11 @@ function parseEnabled(raw: Raw, file: string): boolean {
     if (value === "true") return true;
     if (value === "false") return false;
   }
-  fail(file, "enabled", `"enabled" must be a boolean or the string "true"/"false", got ${typeof value}.`);
+  fail(
+    file,
+    "enabled",
+    `"enabled" must be a boolean or the string "true"/"false", got ${typeof value}.`,
+  );
 }
 
 function parseModel(raw: Raw, file: string): string | undefined {
@@ -187,7 +195,13 @@ export function parseObserverDefinition(
   const description = requireString(frontmatter, "description", sourcePath);
   const on = oneOf<TriggerEvent>(frontmatter, "on", TRIGGER_EVENTS, sourcePath);
 
-  const tools = manyOf<string>(frontmatter, "tools", [...ALLOWED_TOOLS, "write", "edit", "bash"], sourcePath, []);
+  const tools = manyOf<string>(
+    frontmatter,
+    "tools",
+    [...ALLOWED_TOOLS, "write", "edit", "bash"],
+    sourcePath,
+    [],
+  );
   for (const tool of tools) {
     if (!isAllowedTool(tool)) {
       fail(
@@ -200,7 +214,11 @@ export function parseObserverDefinition(
 
   const systemPrompt = body ?? "";
   if (systemPrompt.trim() === "") {
-    fail(sourcePath, "systemPrompt", "Observer file has an empty body; a system prompt is required.");
+    fail(
+      sourcePath,
+      "systemPrompt",
+      "Observer file has an empty body; a system prompt is required.",
+    );
   }
 
   const thinking = oneOf<ThinkingLevel>(
@@ -215,7 +233,11 @@ export function parseObserverDefinition(
 
   const fallback = asList(frontmatter.fallback);
   if (fallback === "invalid") {
-    fail(sourcePath, "fallback", `"fallback" must be a list or comma-separated string, got ${typeof frontmatter.fallback}.`);
+    fail(
+      sourcePath,
+      "fallback",
+      `"fallback" must be a list or comma-separated string, got ${typeof frontmatter.fallback}.`,
+    );
   }
   const fallbackList = fallback ?? [];
 
@@ -227,12 +249,23 @@ export function parseObserverDefinition(
     sees: manyOf<SliceName>(frontmatter, "sees", SLICE_NAMES, sourcePath, []),
     tools: tools as AllowedTool[],
     can: manyOf<Capability>(frontmatter, "can", CAPABILITIES, sourcePath, ["advise"]),
-    deliver: oneOf<DeliveryPoint>(frontmatter, "deliver", DELIVERY_POINTS, sourcePath, DEFAULTS.deliver),
+    deliver: oneOf<DeliveryPoint>(
+      frontmatter,
+      "deliver",
+      DELIVERY_POINTS,
+      sourcePath,
+      DEFAULTS.deliver,
+    ),
     model,
     fallback: fallbackList,
     thinking,
     priority: positiveInt(frontmatter, "priority", sourcePath, DEFAULTS.priority),
-    maxAdvisoryChars: positiveInt(frontmatter, "max_advisory_chars", sourcePath, DEFAULTS.maxAdvisoryChars),
+    maxAdvisoryChars: positiveInt(
+      frontmatter,
+      "max_advisory_chars",
+      sourcePath,
+      DEFAULTS.maxAdvisoryChars,
+    ),
     timeoutMs: positiveInt(frontmatter, "timeout_ms", sourcePath, DEFAULTS.timeoutMs),
     systemPrompt,
     sourcePath,

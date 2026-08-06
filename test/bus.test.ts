@@ -64,7 +64,7 @@ describe("ProposalBus", () => {
   it("times out a hanging run and counts it as a failure", async () => {
     const bus = new ProposalBus();
     bus.kick("o", 10, async (signal) => {
-      await new Promise((resolve, reject) => {
+      await new Promise((_resolve, reject) => {
         signal.addEventListener("abort", () => reject(new Error("aborted")));
       });
       return null;

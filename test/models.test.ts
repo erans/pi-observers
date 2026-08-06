@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { normalizeModelId, resolveObserverModel, type ModelLike, type ModelLookup } from "../src/models.ts";
+import {
+  type ModelLike,
+  type ModelLookup,
+  normalizeModelId,
+  resolveObserverModel,
+} from "../src/models.ts";
 import type { ObserverDefinition } from "../src/types.ts";
 
 function lookupOf(models: ModelLike[]): ModelLookup {
@@ -11,10 +16,23 @@ function lookupOf(models: ModelLike[]): ModelLookup {
 
 function defOf(over: Partial<ObserverDefinition>): ObserverDefinition {
   return {
-    name: "o", description: "d", enabled: true, on: "turn_end", sees: [], tools: [],
-    can: ["advise"], deliver: "next_prompt", fallback: [], thinking: "low", priority: 50,
-    maxAdvisoryChars: 300, timeoutMs: 20000, systemPrompt: "b", sourcePath: "/o.md",
-    scope: "builtin", ...over,
+    name: "o",
+    description: "d",
+    enabled: true,
+    on: "turn_end",
+    sees: [],
+    tools: [],
+    can: ["advise"],
+    deliver: "next_prompt",
+    fallback: [],
+    thinking: "low",
+    priority: 50,
+    maxAdvisoryChars: 300,
+    timeoutMs: 20000,
+    systemPrompt: "b",
+    sourcePath: "/o.md",
+    scope: "builtin",
+    ...over,
   };
 }
 
@@ -23,7 +41,9 @@ const SESSION: ModelLike = { provider: "openai-codex", id: "gpt-5.6-sol" };
 describe("normalizeModelId", () => {
   it("treats . and - as equivalent and drops a trailing date stamp", () => {
     expect(normalizeModelId("claude-haiku-4.5")).toBe(normalizeModelId("claude-haiku-4-5"));
-    expect(normalizeModelId("claude-haiku-4-5-20251001")).toBe(normalizeModelId("claude-haiku-4-5"));
+    expect(normalizeModelId("claude-haiku-4-5-20251001")).toBe(
+      normalizeModelId("claude-haiku-4-5"),
+    );
   });
 });
 
@@ -60,7 +80,9 @@ describe("resolveObserverModel", () => {
 
   it("step 5: falls back to the session model", () => {
     const lookup = lookupOf([SESSION]);
-    const r = resolveObserverModel(defOf({ model: "nope/nope" }), lookup, { sessionModel: SESSION });
+    const r = resolveObserverModel(defOf({ model: "nope/nope" }), lookup, {
+      sessionModel: SESSION,
+    });
     expect(r).toMatchObject({ status: "resolved", via: "session" });
   });
 

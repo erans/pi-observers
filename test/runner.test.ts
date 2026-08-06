@@ -9,11 +9,23 @@ import type { ObserverDefinition } from "../src/types.ts";
 
 function defOf(over: Partial<ObserverDefinition> = {}): ObserverDefinition {
   return {
-    name: "memory-recall", description: "d", enabled: true, on: "turn_end",
-    sees: ["last_user_message"], tools: ["read", "grep"], can: ["advise"],
-    deliver: "next_prompt", fallback: [], thinking: "low", priority: 50,
-    maxAdvisoryChars: 300, timeoutMs: 20000, systemPrompt: "Watch memory.",
-    sourcePath: "/o.md", scope: "builtin", ...over,
+    name: "memory-recall",
+    description: "d",
+    enabled: true,
+    on: "turn_end",
+    sees: ["last_user_message"],
+    tools: ["read", "grep"],
+    can: ["advise"],
+    deliver: "next_prompt",
+    fallback: [],
+    thinking: "low",
+    priority: 50,
+    maxAdvisoryChars: 300,
+    timeoutMs: 20000,
+    systemPrompt: "Watch memory.",
+    sourcePath: "/o.md",
+    scope: "builtin",
+    ...over,
   };
 }
 
@@ -81,8 +93,11 @@ describe("createObserverRunner", () => {
   it("creates the session once and reuses it across runs", async () => {
     const factory = fakeSessionFactory(() => {});
     const runner = await createObserverRunner({
-      def: defOf(), model: { provider: "p", id: "m" }, cwd: "/tmp",
-      agentDir: "/tmp/agent", createSession: factory as never,
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd: "/tmp",
+      agentDir: "/tmp/agent",
+      createSession: factory as never,
     });
     await runner.run({ lastUserMessage: "a" }, new AbortController().signal);
     await runner.run({ lastUserMessage: "b" }, new AbortController().signal);
@@ -94,11 +109,20 @@ describe("createObserverRunner", () => {
     const factory = fakeSessionFactory(async (tools) => {
       // biome-ignore lint/suspicious/noExplicitAny: fake tool invocation
       const propose = (tools as any[]).find((t) => t.name === "propose");
-      await propose.execute("id", { advisory: "see note X", fingerprint: "fp" }, undefined, undefined, {});
+      await propose.execute(
+        "id",
+        { advisory: "see note X", fingerprint: "fp" },
+        undefined,
+        undefined,
+        {},
+      );
     });
     const runner = await createObserverRunner({
-      def: defOf(), model: { provider: "p", id: "m" }, cwd: "/tmp",
-      agentDir: "/tmp/agent", createSession: factory as never,
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd: "/tmp",
+      agentDir: "/tmp/agent",
+      createSession: factory as never,
     });
     const proposal = await runner.run({ lastUserMessage: "a" }, new AbortController().signal);
     expect(proposal).toMatchObject({ observer: "memory-recall", text: "see note X" });
@@ -107,8 +131,11 @@ describe("createObserverRunner", () => {
   it("returns null when the observer stays silent", async () => {
     const factory = fakeSessionFactory(() => {});
     const runner = await createObserverRunner({
-      def: defOf(), model: { provider: "p", id: "m" }, cwd: "/tmp",
-      agentDir: "/tmp/agent", createSession: factory as never,
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd: "/tmp",
+      agentDir: "/tmp/agent",
+      createSession: factory as never,
     });
     expect(await runner.run({}, new AbortController().signal)).toBeNull();
   });
@@ -116,8 +143,11 @@ describe("createObserverRunner", () => {
   it("restricts the session to the definition's tools", async () => {
     const factory = fakeSessionFactory(() => {});
     await createObserverRunner({
-      def: defOf({ tools: ["read"] }), model: { provider: "p", id: "m" },
-      cwd: "/tmp", agentDir: "/tmp/agent", createSession: factory as never,
+      def: defOf({ tools: ["read"] }),
+      model: { provider: "p", id: "m" },
+      cwd: "/tmp",
+      agentDir: "/tmp/agent",
+      createSession: factory as never,
     });
     expect(factory.mock.calls[0]?.[0]).toMatchObject({ tools: ["read"] });
   });
@@ -127,14 +157,22 @@ describe("createObserverRunner", () => {
     let release: () => void = () => {};
     const factory = vi.fn(async () => ({
       session: {
-        prompt: vi.fn(() => new Promise<void>((resolve) => { release = resolve; })),
+        prompt: vi.fn(
+          () =>
+            new Promise<void>((resolve) => {
+              release = resolve;
+            }),
+        ),
         abort,
         dispose: vi.fn(),
       },
     }));
     const runner = await createObserverRunner({
-      def: defOf(), model: { provider: "p", id: "m" }, cwd: "/tmp",
-      agentDir: "/tmp/agent", createSession: factory as never,
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd: "/tmp",
+      agentDir: "/tmp/agent",
+      createSession: factory as never,
     });
     const controller = new AbortController();
     const pending = runner.run({ lastUserMessage: "a" }, controller.signal);
@@ -152,8 +190,11 @@ describe("createObserverRunner", () => {
       session: { prompt: vi.fn(async () => {}), abort, dispose: vi.fn() },
     }));
     const runner = await createObserverRunner({
-      def: defOf(), model: { provider: "p", id: "m" }, cwd: "/tmp",
-      agentDir: "/tmp/agent", createSession: factory as never,
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd: "/tmp",
+      agentDir: "/tmp/agent",
+      createSession: factory as never,
     });
     const controller = new AbortController();
     // Five completed runs on one signal. The session outlives them all, so a listener
@@ -202,8 +243,11 @@ const emit = (tools: any[], name: string, params: unknown) =>
 
 function build(h: ReturnType<typeof harness>, over: Partial<ObserverDefinition> = {}) {
   return createObserverRunner({
-    def: defOf(over), model: { provider: "p", id: "m" }, cwd: "/tmp",
-    agentDir: "/tmp/agent", createSession: h.factory as never,
+    def: defOf(over),
+    model: { provider: "p", id: "m" },
+    cwd: "/tmp",
+    agentDir: "/tmp/agent",
+    createSession: h.factory as never,
   });
 }
 
@@ -251,30 +295,76 @@ describe("createObserverRunner (exploratory)", () => {
       JSON.stringify({
         name: "leaky-theme",
         vars: {
-          cyan: "#00d7ff", blue: "#5f87ff", green: "#b5bd68", red: "#cc6666",
-          yellow: "#ffff00", text: "#d4d4d4", gray: "#808080", dimGray: "#666666",
-          darkGray: "#505050", accent: "#8abeb7", selectedBg: "#3a3a4a",
-          userMsgBg: "#343541", toolPendingBg: "#282832", toolSuccessBg: "#283228",
-          toolErrorBg: "#3c2828", customMsgBg: "#2d2838",
+          cyan: "#00d7ff",
+          blue: "#5f87ff",
+          green: "#b5bd68",
+          red: "#cc6666",
+          yellow: "#ffff00",
+          text: "#d4d4d4",
+          gray: "#808080",
+          dimGray: "#666666",
+          darkGray: "#505050",
+          accent: "#8abeb7",
+          selectedBg: "#3a3a4a",
+          userMsgBg: "#343541",
+          toolPendingBg: "#282832",
+          toolSuccessBg: "#283228",
+          toolErrorBg: "#3c2828",
+          customMsgBg: "#2d2838",
         },
         colors: {
-          accent: "accent", border: "blue", borderAccent: "cyan", borderMuted: "darkGray",
-          success: "green", error: "red", warning: "yellow", muted: "gray", dim: "dimGray",
-          text: "text", thinkingText: "gray", selectedBg: "selectedBg",
-          userMessageBg: "userMsgBg", userMessageText: "text", customMessageBg: "customMsgBg",
-          customMessageText: "text", customMessageLabel: "#9575cd",
-          toolPendingBg: "toolPendingBg", toolSuccessBg: "toolSuccessBg",
-          toolErrorBg: "toolErrorBg", toolTitle: "text", toolOutput: "gray",
-          mdHeading: "#f0c674", mdLink: "#81a2be", mdLinkUrl: "dimGray", mdCode: "accent",
-          mdCodeBlock: "green", mdCodeBlockBorder: "gray", mdQuote: "gray",
-          mdQuoteBorder: "gray", mdHr: "gray", mdListBullet: "accent",
-          toolDiffAdded: "green", toolDiffRemoved: "red", toolDiffContext: "gray",
-          syntaxComment: "#6A9955", syntaxKeyword: "#569CD6", syntaxFunction: "#DCDCAA",
-          syntaxVariable: "#9CDCFE", syntaxString: "#CE9178", syntaxNumber: "#B5CEA8",
-          syntaxType: "#4EC9B0", syntaxOperator: "#D4D4D4", syntaxPunctuation: "#D4D4D4",
-          thinkingOff: "darkGray", thinkingMinimal: "#6e6e6e", thinkingLow: "#5f87af",
-          thinkingMedium: "#81a2be", thinkingHigh: "#b294bb", thinkingXhigh: "#d183e8",
-          thinkingMax: "#ff5fff", bashMode: "green",
+          accent: "accent",
+          border: "blue",
+          borderAccent: "cyan",
+          borderMuted: "darkGray",
+          success: "green",
+          error: "red",
+          warning: "yellow",
+          muted: "gray",
+          dim: "dimGray",
+          text: "text",
+          thinkingText: "gray",
+          selectedBg: "selectedBg",
+          userMessageBg: "userMsgBg",
+          userMessageText: "text",
+          customMessageBg: "customMsgBg",
+          customMessageText: "text",
+          customMessageLabel: "#9575cd",
+          toolPendingBg: "toolPendingBg",
+          toolSuccessBg: "toolSuccessBg",
+          toolErrorBg: "toolErrorBg",
+          toolTitle: "text",
+          toolOutput: "gray",
+          mdHeading: "#f0c674",
+          mdLink: "#81a2be",
+          mdLinkUrl: "dimGray",
+          mdCode: "accent",
+          mdCodeBlock: "green",
+          mdCodeBlockBorder: "gray",
+          mdQuote: "gray",
+          mdQuoteBorder: "gray",
+          mdHr: "gray",
+          mdListBullet: "accent",
+          toolDiffAdded: "green",
+          toolDiffRemoved: "red",
+          toolDiffContext: "gray",
+          syntaxComment: "#6A9955",
+          syntaxKeyword: "#569CD6",
+          syntaxFunction: "#DCDCAA",
+          syntaxVariable: "#9CDCFE",
+          syntaxString: "#CE9178",
+          syntaxNumber: "#B5CEA8",
+          syntaxType: "#4EC9B0",
+          syntaxOperator: "#D4D4D4",
+          syntaxPunctuation: "#D4D4D4",
+          thinkingOff: "darkGray",
+          thinkingMinimal: "#6e6e6e",
+          thinkingLow: "#5f87af",
+          thinkingMedium: "#81a2be",
+          thinkingHigh: "#b294bb",
+          thinkingXhigh: "#d183e8",
+          thinkingMax: "#ff5fff",
+          bashMode: "green",
         },
       }),
     );
@@ -293,7 +383,10 @@ describe("createObserverRunner (exploratory)", () => {
     const h = harness();
     const { cwd, agentDir } = leakyFixture();
     await createObserverRunner({
-      def: defOf(), model: { provider: "p", id: "m" }, cwd, agentDir,
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd,
+      agentDir,
       createSession: h.factory as never,
     });
     const loader = h.options().resourceLoader;
@@ -317,7 +410,10 @@ describe("createObserverRunner (exploratory)", () => {
     const h = harness();
     const { cwd, agentDir } = leakyFixture();
     await createObserverRunner({
-      def: defOf(), model: { provider: "p", id: "m" }, cwd, agentDir,
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd,
+      agentDir,
       createSession: h.factory as never,
     });
     expect(h.options().resourceLoader.getAppendSystemPrompt()).toEqual([]);
@@ -328,7 +424,10 @@ describe("createObserverRunner (exploratory)", () => {
     const h = harness();
     const { cwd, agentDir } = leakyFixture();
     await createObserverRunner({
-      def: defOf(), model: { provider: "p", id: "m" }, cwd, agentDir,
+      def: defOf(),
+      model: { provider: "p", id: "m" },
+      cwd,
+      agentDir,
       createSession: h.factory as never,
     });
     const loader = h.options().resourceLoader;
@@ -633,7 +732,9 @@ describe("createObserverRunner (exploratory)", () => {
     // biome-ignore lint/suspicious/noExplicitAny: fake tool invocation
     expect(h.options().customTools.map((t: any) => t.name)).toEqual(["veto"]);
     expect(await runner.run({}, new AbortController().signal)).toMatchObject({
-      kind: "veto", text: "tests not run", observer: "memory-recall",
+      kind: "veto",
+      text: "tests not run",
+      observer: "memory-recall",
     });
   });
 
@@ -650,7 +751,8 @@ describe("createObserverRunner (exploratory)", () => {
     });
     const runner = await build(h, { priority: 12, deliver: "settle" });
     expect(await runner.run({}, new AbortController().signal)).toMatchObject({
-      priority: 12, deliver: "settle",
+      priority: 12,
+      deliver: "settle",
     });
   });
 });

@@ -104,6 +104,7 @@ export function readGoal(cwd: string): string | undefined {
  *   \u2028  LINE SEPARATOR
  *   \u2029  PARAGRAPH SEPARATOR
  */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: deliberate line-separator class collapsing attacker-influenceable observer name/model frontmatter into a single status row; removing any codepoint reintroduces status-row forgery via a crafted .pi/observers/*.md file.
 const ROW_LINE_SEPARATORS = /[\r\n\u0085\u000B\u000C\u2028\u2029]+/g;
 
 /**

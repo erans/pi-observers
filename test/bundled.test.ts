@@ -16,7 +16,10 @@ describe("bundled observers", () => {
     const { observers, errors } = load();
     expect(errors).toEqual([]);
     expect(observers.map((o) => o.name).sort()).toEqual([
-      "goal-tracker", "memory-recall", "skill-recall", "verification",
+      "goal-tracker",
+      "memory-recall",
+      "skill-recall",
+      "verification",
     ]);
   });
 
@@ -45,7 +48,10 @@ describe("bundled observers", () => {
   it("uses the triggers and delivery points from the spec", () => {
     const byName = Object.fromEntries(load().observers.map((o) => [o.name, o]));
     expect(byName["memory-recall"]).toMatchObject({ on: "turn_end", deliver: "next_prompt" });
-    expect(byName["skill-recall"]).toMatchObject({ on: "before_agent_start", deliver: "next_prompt" });
+    expect(byName["skill-recall"]).toMatchObject({
+      on: "before_agent_start",
+      deliver: "next_prompt",
+    });
     expect(byName["goal-tracker"]).toMatchObject({ on: "agent_settled", deliver: "settle" });
     expect(byName.verification).toMatchObject({ on: "agent_settled", deliver: "settle" });
   });
