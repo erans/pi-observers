@@ -63,8 +63,11 @@ export class ProposalBus {
     });
 
     const runPromise = run(controller.signal);
-    // An abandoned run that rejects AFTER the race was already decided must not
-    // surface as an unhandled rejection.
+    // No-op sink, not a safety net: Promise.race already attaches its own
+    // rejection handler to every input promise, so a late rejection from this
+    // abandoned run is never reported as unhandled even without this line.
+    // Kept so the intent is documented and stays true if the race is ever
+    // refactored away.
     runPromise.catch(() => {});
 
     entry.inflight = Promise.race([runPromise, timeout])

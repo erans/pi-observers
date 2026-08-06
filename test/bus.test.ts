@@ -254,4 +254,37 @@ describe("ProposalBus", () => {
     expect(status.consecutiveFailures).toBe(1);
     expect(bus.isDisabled("o")).toBe(false);
   });
+
+  it("status() returns a copy: mutating the returned object cannot affect the bus's own bookkeeping", async () => {
+    const bus = new ProposalBus();
+    bus.kick("o", 1000, async () => proposal("a"));
+    await bus.settle();
+
+    const snapshot = bus.status("o");
+    snapshot.runs = 999;
+    snapshot.failures = 999;
+    snapshot.consecutiveFailures = 999;
+    snapshot.disabled = true;
+    snapshot.lastError = "tampered";
+
+    const after = bus.status("o");
+    expect(after.runs).toBe(1);
+    expect(after.failures).toBe(0);
+    expect(after.consecutiveFailures).toBe(0);
+    expect(after.disabled).toBe(false);
+    expect(after.lastError).toBeUndefined();
+    expect(bus.isDisabled("o")).toBe(false);
+  });
+
+  it("clears the pending timeout once a run settles, leaving no timer behind", async () => {
+    vi.useFakeTimers();
+    try {
+      const bus = new ProposalBus();
+      bus.kick("o", 1000, async () => proposal("a"));
+      await bus.settle();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
