@@ -232,10 +232,36 @@ function textOfLast(ctx: unknown, role: "user" | "assistant"): string | undefine
   return undefined;
 }
 
+/**
+ * Session entry types that carry conversation content, and so belong in the transcript
+ * slice. Everything else pi records is bookkeeping.
+ *
+ * Observed live: an observer's rendered transcript opened with `model_change`,
+ * `thinking_level_change` and a `custom` entry belonging to an unrelated extension
+ * (`extmgr-auto-update`), spending an observer's context budget -- and its truncation
+ * budget, since the slice is tail-truncated -- on events no observer can act on.
+ *
+ * `compaction` is kept: when a session compacts, that entry carries the summary standing
+ * in for the history it replaced, so dropping it would lose conversation, not noise.
+ *
+ * `custom` is dropped rather than kept, for two reasons beyond volume. Any extension can
+ * write one, so its contents are outside this extension's threat model as much as any
+ * other repo-resident text. And this extension's OWN advisories and vetoes are delivered
+ * as custom entries: feeding them back means an observer reads what observers already
+ * said and can react to it, which is the one input guaranteed to compound.
+ */
+const TRANSCRIPT_ENTRY_TYPES = new Set(["message", "compaction"]);
+
 function transcriptOf(ctx: unknown): string | undefined {
   try {
     const entries = (ctx as SessionReader)?.sessionManager?.buildContextEntries?.() ?? [];
     const text = entries
+      .filter((e: unknown) => {
+        // Unknown or absent type is dropped, not kept: a new pi entry type is bookkeeping
+        // until this extension has looked at it and decided it is content.
+        const type = (e as { type?: unknown } | null)?.type;
+        return typeof type === "string" && TRANSCRIPT_ENTRY_TYPES.has(type);
+      })
       .map((e: unknown) => JSON.stringify(e))
       .join("\n")
       .slice(-TRANSCRIPT_TAIL_CHARS); // tail-first truncation: recent context is what matters
