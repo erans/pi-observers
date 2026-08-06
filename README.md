@@ -162,6 +162,34 @@ same point again -- it is not silently recorded as delivered.
 
 `maxAdvisoriesPerTurn` and `vetoBudget` are both capped at 10 however high you set them.
 
+### Which model an observer runs on
+
+Every observer is resolved through the same chain, in order, stopping at the first hit:
+
+1. its own `model:`, or `defaultModel` if it declares none
+2. each entry in its `fallback:`, in order
+3. **the session's own model** -- whatever you are running pi with
+4. otherwise the observer is disabled, with the reason shown in `/observers`
+
+Steps 1 and 2 each try an exact match, then a fuzzy one, then the same id under any
+provider. So **you do not have to set `defaultModel` at all**: leave it out and every
+observer runs on your session model. Setting it is worth doing anyway -- observers are
+small, frequent, throwaway calls, and pointing them at something cheap and fast keeps
+them off your main model's bill.
+
+A model is only considered for steps 1 and 2 if its provider has configured auth.
+That is what makes the chain useful: naming a model you have no credentials for falls
+through to your fallbacks and then to the session model, rather than resolving to
+something that cannot run.
+
+The gap worth knowing: auth is not the same as *working*. A model that is in pi's
+catalog, with auth configured, but which the provider refuses at call time -- a
+retired id, a model your account is not entitled to -- resolves successfully. The
+observer is then reported active on that model, every run fails, and it is disabled
+after three consecutive failures with the provider's error in `/observers`. Nothing
+can predict that without making the call; the three-strike disable is the backstop,
+and it is why `/observers` reports the last error rather than only a count.
+
 `vetoBudget` is per observer **per fingerprint** -- the string the observer uses to
 identify the thing it is objecting to. It is not a bound on its own, because the
 fingerprint is chosen by the observer's model: vary it and you get a fresh budget. Two
