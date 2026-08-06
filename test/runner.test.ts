@@ -375,6 +375,39 @@ describe("createObserverRunner (exploratory)", () => {
     // Not the user's real project settings, regardless of what SettingsManager.inMemory
     // happens to default to today.
     expect(opts.settingsManager.isProjectTrusted()).toBe(false);
+    // Retry and thinkingBudgets are not set anywhere in the literal `inMemory(...)`
+    // settings object above, so these getters return pi's own built-in defaults —
+    // never a value read from the host's real global settings.json or a repo's
+    // project settings.json. `getProviderRetrySettings()` and `getThinkingBudgets()`
+    // are trivial synchronous getters on this same settingsManager instance, so this
+    // is directly observable through the seam the two assertions above already use;
+    // there is no seam-limitation excusing leaving it unchecked.
+    expect(opts.settingsManager.getProviderRetrySettings()).toEqual({
+      timeoutMs: undefined,
+      maxRetries: undefined,
+      maxRetryDelayMs: 60000,
+    });
+    expect(opts.settingsManager.getThinkingBudgets()).toBeUndefined();
+  });
+
+  it("shares the same hermetic settings manager with the resource loader", async () => {
+    // Defect guard: DefaultResourceLoader has its own independent default —
+    // `options.settingsManager ?? SettingsManager.create(this.cwd, this.agentDir)`
+    // (resource-loader.js) — separate from createAgentSession's. Passing
+    // `settingsManager` to the factory alone would leave this second default in
+    // place, silently reading a real settings.json for the resource loader while the
+    // session itself stayed hermetic. `DefaultResourceLoader` exposes no public
+    // getter for the settings manager it was constructed with, so this reaches past
+    // the declared TS `private` (a compile-time-only annotation on a plain runtime
+    // field, not a real `#private`) to confirm the actual instance the constructor
+    // stored is the one shared object created in runner.ts — not merely an
+    // instance that happens to satisfy the same interface.
+    const h = harness();
+    await build(h);
+    const opts = h.options();
+    // biome-ignore lint/suspicious/noExplicitAny: reaching past a TS-only `private`
+    // annotation to observe constructor wiring with no public getter available.
+    expect((opts.resourceLoader as any).settingsManager).toBe(opts.settingsManager);
   });
 
   it("names itself after the definition", async () => {
