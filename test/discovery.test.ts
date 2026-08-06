@@ -252,8 +252,17 @@ describe("discoverObservers", () => {
   it("does not report a cross-layer override as a duplicate", () => {
     writeFileSync(join(builtinDir, "a.md"), def("same", "builtin"));
     writeFileSync(join(agentDir, "observers", "a.md"), def("same", "user"));
-    const { errors } = discoverObservers({ cwd, agentDir, builtinDir, projectTrusted: true });
-    expect(errors).toEqual([]);
+    const { observers, errors } = discoverObservers({
+      cwd,
+      agentDir,
+      builtinDir,
+      projectTrusted: true,
+    });
+    // Cross-layer override now emits a warning so silent shadowing of safety observers is visible.
+    expect(observers).toHaveLength(1);
+    expect(observers[0]?.description).toBe("user");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.message).toMatch(/overrides builtin/);
   });
 
   it("ignores non-markdown files", () => {

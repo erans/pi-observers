@@ -119,6 +119,12 @@ function longestRun(value: string, char: string): number {
   return best;
 }
 
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+function replaceLoneSurrogates(value: string): string {
+  return value.replace(LONE_SURROGATE, "\uFFFD");
+}
+
 /** Truncate to `maxCodePoints` code points, never splitting a surrogate pair. */
 function truncateCodePoints(value: string, maxCodePoints: number): string {
   const points = Array.from(value);
@@ -135,7 +141,8 @@ function truncateCodePoints(value: string, maxCodePoints: number): string {
  * the host agent would read as instructions rather than as quoted data.
  */
 function oneLine(value: string, maxCodePoints: number): string {
-  const collapsed = value.replace(ADVISORY_LINE_SEPARATORS, " ");
+  const paired = replaceLoneSurrogates(value);
+  const collapsed = paired.replace(ADVISORY_LINE_SEPARATORS, " ");
   const truncated = truncateCodePoints(collapsed, maxCodePoints);
   return truncated.length < collapsed.length ? `${truncated}...` : collapsed;
 }
@@ -415,11 +422,31 @@ export function readObserverSettingsBlock(cwd: string, projectTrusted: boolean):
     const project = manager.getProjectSettings() as unknown as Record<string, unknown>;
     const globalBlock = asRecord(global.observers);
     const projectBlock = asRecord(project.observers);
-    const merged = { ...globalBlock, ...projectBlock };
+    // `disable` is merged as a union, not shallow-replaced: a global disable of
+    // "noisy-observer" must not be re-enabled by a project's `disable: ["other"]`.
+    const merged: Record<string, unknown> = { ...globalBlock, ...projectBlock };
+    const globalDisable = Array.isArray(globalBlock.disable) ? globalBlock.disable : [];
+    const projectDisable = Array.isArray(projectBlock.disable) ? projectBlock.disable : [];
+    if (globalDisable.length > 0 || projectDisable.length > 0) {
+      const seen = new Set<string>();
+      const union: string[] = [];
+      for (const n of [...globalDisable, ...projectDisable]) {
+        if (typeof n === "string" && n.trim() !== "" && !seen.has(n.trim())) {
+          seen.add(n.trim());
+          union.push(n.trim());
+        }
+      }
+      merged.disable = union;
+    }
     return Object.keys(merged).length > 0 ? merged : undefined;
-  } catch {
-    // Tolerant on purpose, matching parseSettings: a broken settings file must degrade
-    // to defaults rather than take every observer down at startup.
+  } catch (error) {
+    // Tolerant but not silent: surface the cause so a broken global settings.json
+    // does not invisibly degrade to defaults while the user believes their disable
+    // list is active. The caller (session_start) renders discoveryErrors via
+    // observerNotes, so we push a synthetic entry there by storing on a module-level
+    // variable that the next session_start drains — but to keep this function pure we
+    // just warn to the console and still degrade to defaults.
+    console.warn(`[pi-observers] failed to read observer settings: ${String(error)}`);
     return undefined;
   }
 }
@@ -509,7 +536,7 @@ export const MAX_HELD_PROPOSALS = 100;
 export const MAX_TURN_TOOL_CALLS = 500;
 
 /** Bound on in-flight tool-call arguments awaiting their tool_execution_end. */
-const MAX_PENDING_TOOL_ARGS = 200;
+const MAX_PENDING_TOOL_ARGS = 500;
 
 /** Cap on one rendered tool-call argument summary. */
 const MAX_TOOL_ARGS_CHARS = 120;
@@ -1037,7 +1064,10 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
   });
 
   pi.on("tool_execution_start", async (event) => {
-    if (pendingToolArgs.size >= MAX_PENDING_TOOL_ARGS) return;
+    if (pendingToolArgs.size >= MAX_PENDING_TOOL_ARGS) {
+      const oldestKey = pendingToolArgs.keys().next().value as string;
+      pendingToolArgs.delete(oldestKey);
+    }
     pendingToolArgs.set(event.toolCallId, summarizeArgs(event.args));
   });
 
@@ -1092,6 +1122,11 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     // deferred backlog gets its chance in the fresh window. Delivery goes through
     // sendMessage like every other flush -- pi appends an idle-delivered message to
     // the session directly, so it reaches this request's very first LLM call.
+    // Cancel any debounced flush so the window accounting is not double-counted.
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = undefined;
+    }
     advisoriesThisWindow = 0;
     vetoThisWindow = false;
     // event.prompt is the request about to run. It is not in the session yet, so an
@@ -1106,6 +1141,10 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     kickAll("agent_settled", ctx);
     // The other window boundary. Advisories delivered from here on are appended while
     // idle and land in the NEXT request's context, so they draw on its budget.
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = undefined;
+    }
     advisoriesThisWindow = 0;
     vetoThisWindow = false;
     flush();

@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
@@ -22,13 +30,14 @@ export function goalFilePath(cwd: string): string {
 /**
  * True when `error` is Node reporting that `path` refused a plain-file write because
  * something other than a regular file sits there — a directory, most commonly.
- * EISDIR is the normal signal; EPERM/EACCES are the same situation on platforms
- * (notably Windows, and some EACCES-reporting filesystems) that refuse a directory
- * write with a permissions error instead of EISDIR.
+ * Only EISDIR is treated as a directory signal here; EPERM/EACCES are surfaced
+ * to the caller, because deleting on a permission error would remove a file the
+ * user cannot write to. Callers that need Windows EPERM-for-directory handling
+ * must verify with stat before deleting.
  */
 function isDirectoryWriteError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
-  return code === "EISDIR" || code === "EPERM" || code === "EACCES";
+  return code === "EISDIR";
 }
 
 /** Writing empty text clears the goal. Returns the stored goal, or "" if cleared.
@@ -58,13 +67,27 @@ export function writeGoal(cwd: string, text: string): string {
     writeFileSync(path, `${trimmed}\n`, "utf8");
   } catch (error) {
     if (!isDirectoryWriteError(error)) throw error;
-    // Only reachable when the goal path is (or contains) a directory rather than a
-    // plain file — e.g. left behind by a prior crash, or a user poking around with
-    // `mkdir`. Clear it out and retry once. This costs atomicity on THIS recovery
-    // path only (a crash between the rmSync and the writeFileSync below would lose
-    // whatever was at `path`, but there was never a readable goal there to lose —
-    // it was a directory), never on the ordinary overwrite above.
-    rmSync(path, { recursive: true, force: true });
+    // Verify the path really is a directory before deleting. EPERM/EACCES are no
+    // longer treated as directory signals above, and even EISDIR is double-checked
+    // to avoid deleting a symlink to a file via recursive rm (Node's rmSync on a
+    // directory symlink removes the symlink itself, but we prefer explicit unlink).
+    try {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) {
+        unlinkSync(path);
+      } else if (!stat.isDirectory()) {
+        throw error;
+      } else {
+        rmSync(path, { recursive: true, force: true });
+      }
+    } catch {
+      // If lstat fails, fall back to recursive remove for EISDIR case (original behavior)
+      try {
+        rmSync(path, { recursive: true, force: true });
+      } catch {
+        throw error;
+      }
+    }
     writeFileSync(path, `${trimmed}\n`, "utf8");
   }
   return trimmed;

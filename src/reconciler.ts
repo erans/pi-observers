@@ -1,3 +1,4 @@
+import { isBlank } from "./outputs.ts";
 import { DEFAULTS, type Proposal } from "./types.ts";
 
 /**
@@ -23,7 +24,7 @@ const MAX_FINGERPRINT_LENGTH = 512;
 function validKeyPart(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
-  if (trimmed === "" || trimmed.length > MAX_FINGERPRINT_LENGTH) return undefined;
+  if (isBlank(trimmed) || trimmed.length > MAX_FINGERPRINT_LENGTH) return undefined;
   return trimmed;
 }
 
@@ -346,7 +347,13 @@ export class Reconciler {
     // Only advisories are added to the accepted set. Vetoes are governed by budget, not dedupe.
     // A proposal dropped for budget must stay eligible next turn, otherwise a busy turn
     // silently discards advice.
-    for (const proposal of kept) this.#acceptedFingerprints.add(proposal.fingerprint);
+    for (const proposal of kept) {
+      this.#acceptedFingerprints.add(proposal.fingerprint);
+      if (this.#acceptedFingerprints.size > MAX_RESTORED_ENTRIES) {
+        const oldest = this.#acceptedFingerprints.values().next().value as string;
+        this.#acceptedFingerprints.delete(oldest);
+      }
+    }
 
     return { advisories: kept, veto, dropped };
   }

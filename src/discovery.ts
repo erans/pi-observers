@@ -25,8 +25,11 @@ export interface DiscoveryResult {
 function hasDefinitions(dir: string): boolean {
   try {
     return readdirSync(dir).some((entry) => entry.endsWith(".md"));
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+    // Permission errors (EACCES/EPERM) should not suppress the trust warning —
+    // propagate as true so the caller can surface the unreadable state.
+    return true;
   }
 }
 
@@ -121,13 +124,22 @@ export function discoverObservers(opts: DiscoveryOptions): DiscoveryResult {
       // filename sorts later -- so the observer a user edits may not be the one that
       // runs, and nothing says so.
       const prior = byName.get(definition.name);
-      if (prior !== undefined && prior.scope === scope) {
-        errors.push(
-          new ObserverDefinitionError(
-            `duplicate observer name "${definition.name}" in the ${scope} layer; "${prior.sourcePath}" is ignored in favour of this file`,
-            definition.sourcePath,
-          ),
-        );
+      if (prior !== undefined) {
+        if (prior.scope === scope) {
+          errors.push(
+            new ObserverDefinitionError(
+              `duplicate observer name "${definition.name}" in the ${scope} layer; "${prior.sourcePath}" is ignored in favour of this file`,
+              definition.sourcePath,
+            ),
+          );
+        } else {
+          errors.push(
+            new ObserverDefinitionError(
+              `observer "${definition.name}" from ${scope} layer overrides ${prior.scope} definition at "${prior.sourcePath}"`,
+              definition.sourcePath,
+            ),
+          );
+        }
       }
       byName.set(definition.name, definition);
     }

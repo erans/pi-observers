@@ -85,7 +85,24 @@ function requireString(raw: Raw, key: string, file: string): string {
   if (typeof value !== "string" || value.trim() === "") {
     fail(file, key, `Observer file is missing required field "${key}".`);
   }
-  return value.trim();
+  const trimmed = value.trim();
+  if (key === "name") {
+    if (trimmed.length > 64) {
+      fail(file, key, `"name" must be <= 64 characters, got ${trimmed.length}.`);
+    }
+    if (!/^[a-z0-9][a-z0-9_-]*$/.test(trimmed)) {
+      fail(
+        file,
+        key,
+        `"name" must match /^[a-z0-9][a-z0-9_-]*$/ (lowercase alphanumeric, hyphen, underscore), got "${trimmed}".`,
+      );
+    }
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control/separator check
+    if (/[\u0000-\u001F\u007F-\u009F\u0085\u2028\u2029]/.test(trimmed)) {
+      fail(file, key, `"name" must not contain control or separator characters.`);
+    }
+  }
+  return trimmed;
 }
 
 function oneOf<T extends string>(
@@ -131,12 +148,21 @@ function manyOf<T extends string>(
   return list as T[];
 }
 
-function positiveInt(raw: Raw, key: string, file: string, fallbackValue: number): number {
+function positiveInt(
+  raw: Raw,
+  key: string,
+  file: string,
+  fallbackValue: number,
+  max?: number,
+): number {
   const value = raw[key];
   if (value === undefined || value === null) return fallbackValue;
   const num = Number(value);
   if (!Number.isFinite(num) || !Number.isInteger(num) || num <= 0) {
     fail(file, key, `"${key}" must be a positive integer, got ${String(value)}.`);
+  }
+  if (max !== undefined && num > max) {
+    fail(file, key, `"${key}" must be <= ${max}, got ${num}.`);
   }
   return num;
 }
@@ -259,14 +285,15 @@ export function parseObserverDefinition(
     model,
     fallback: fallbackList,
     thinking,
-    priority: positiveInt(frontmatter, "priority", sourcePath, DEFAULTS.priority),
+    priority: positiveInt(frontmatter, "priority", sourcePath, DEFAULTS.priority, 100),
     maxAdvisoryChars: positiveInt(
       frontmatter,
       "max_advisory_chars",
       sourcePath,
       DEFAULTS.maxAdvisoryChars,
+      2000,
     ),
-    timeoutMs: positiveInt(frontmatter, "timeout_ms", sourcePath, DEFAULTS.timeoutMs),
+    timeoutMs: positiveInt(frontmatter, "timeout_ms", sourcePath, DEFAULTS.timeoutMs, 120_000),
     systemPrompt,
     sourcePath,
     scope,

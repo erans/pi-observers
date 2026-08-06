@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
@@ -69,34 +69,46 @@ export function writeMemoryNote(opts: { cwd: string; text: string; type?: string
   const base = deriveSlug(text);
   let slug = base;
   let n = 1;
-  while (existsSync(join(dir, `${slug}.md`))) {
-    n += 1;
-    slug = `${base}-${n}`;
-  }
-
-  const path = join(dir, `${slug}.md`);
+  // TOCTOU: existsSync + writeFileSync is non-atomic. Two concurrent /remember calls
+  // could both see the file as absent and one would overwrite the other. Use wx flag
+  // (fail if exists) and retry on EEXIST.
+  let path = join(dir, `${slug}.md`);
   const type = NOTE_TYPES.includes(opts.type as (typeof NOTE_TYPES)[number])
     ? (opts.type as string)
     : DEFAULT_NOTE_TYPE;
-  // name and description are both derived from arbitrary user text and MUST be quoted.
-  // Unquoted, a colon makes the frontmatter fail to parse, a leading "-" turns it into a
-  // sequence, and a leading "#" makes the whole value parse as null — silently discarding
-  // the value with no error anywhere. Even when none of that applies, an unquoted scalar
-  // that happens to be a YAML core-schema keyword parses as the wrong TYPE rather than as
-  // a string: a slug of "true"/"false" parses as a boolean, "null" as null, and a
-  // slug that is all digits (e.g. "42") as a number — all reachable through deriveSlug
-  // from ordinary note text ("True", "Null", "42"). JSON.stringify emits a double-quoted
-  // scalar that YAML accepts, with quotes and backslashes escaped, and it is fully
-  // deterministic. `type` is exempt: it is validated above against a fixed vocabulary of
-  // four lowercase words, none of which collides with a YAML keyword or parses as a
-  // number, so it cannot reach either failure mode.
-  const content = `---
+  let content: string;
+  for (let attempts = 0; attempts < 100; attempts++) {
+    const sanitizedText = text.startsWith("---") ? `\n${text}` : text;
+    content = `---
 name: ${JSON.stringify(slug)}
 description: ${JSON.stringify(deriveDescription(text))}
 type: ${type}
 ---
 
-${text}
+${sanitizedText}
+`;
+    try {
+      writeFileSync(path, content, { encoding: "utf8", flag: "wx" });
+      return { path, slug };
+    } catch (error) {
+      const code = (error as { code?: string } | null)?.code;
+      if (code === "EEXIST") {
+        n += 1;
+        slug = `${base}-${n}`;
+        path = join(dir, `${slug}.md`);
+        continue;
+      }
+      throw error;
+    }
+  }
+  // Fallback if wx loop exhausted (should not happen)
+  content = `---
+name: ${JSON.stringify(slug)}
+description: ${JSON.stringify(deriveDescription(text))}
+type: ${type}
+---
+
+${text.startsWith("---") ? `\n${text}` : text}
 `;
   writeFileSync(path, content, "utf8");
   return { path, slug };
