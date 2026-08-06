@@ -67,7 +67,12 @@ const VETO_SPEND_ENTRY = "observers-veto-spend";
  *   \u2028  LINE SEPARATOR
  *   \u2029  PARAGRAPH SEPARATOR
  */
-const ADVISORY_LINE_SEPARATORS = /[\r\n\u0085\u000B\u000C\u001C\u001D\u001E\u2028\u2029]+/g;
+/** The class above, as source text. Built through `new RegExp` rather than written as
+ *  a regex literal for the same reason src/slices.ts does it: a literal containing
+ *  \u000B and friends trips biome's noControlCharactersInRegex, and suppressing the
+ *  rule would suppress it for any control character a later edit added by accident. */
+const LINE_SEPARATOR_CHARS = "\\r\\n\\u0085\\u000B\\u000C\\u001C\\u001D\\u001E\\u2028\\u2029";
+const ADVISORY_LINE_SEPARATORS = new RegExp(`[${LINE_SEPARATOR_CHARS}]+`, "g");
 
 /**
  * Caps on the two attacker-reachable fields of a Proposal, in code points.
