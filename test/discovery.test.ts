@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -35,6 +35,23 @@ describe("discoverObservers", () => {
     expect(errors).toEqual([]);
     expect(observers.map((o) => o.name)).toEqual(["a"]);
     expect(observers[0]?.scope).toBe("builtin");
+  });
+
+  it("does not warn 'not trusted' when .pi/observers is a regular file, not a dir", () => {
+    // ENOTDIR from readdirSync must not be treated as "has definitions" — a file at
+    // that path is not a loadable observer dir, and the trust warning is misleading.
+    const observersDir = join(cwd, ".pi", "observers");
+    // beforeEach already created observersDir as a dir; replace it with a file.
+    rmSync(observersDir, { recursive: true, force: true });
+    writeFileSync(observersDir, "not a dir", "utf8");
+    const { observers, errors } = discoverObservers({
+      cwd,
+      agentDir,
+      builtinDir,
+      projectTrusted: false,
+    });
+    expect(observers).toEqual([]);
+    expect(errors).toEqual([]);
   });
 
   it("lets user override builtin, and project override user", () => {
