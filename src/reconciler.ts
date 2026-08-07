@@ -1,4 +1,4 @@
-import { isBlank } from "./outputs.ts";
+import { isBlank, MAX_FINGERPRINT_LENGTH } from "./outputs.ts";
 import { DEFAULTS, type Proposal } from "./types.ts";
 
 /**
@@ -18,7 +18,6 @@ const MAX_RESTORED_ENTRIES = 1000;
  * advisory with an absurd fingerprint may be delivered again after a reload, which is
  * visible, bounded by the per-turn advisory budget, and strictly the better failure.
  */
-const MAX_FINGERPRINT_LENGTH = 512;
 
 /** The replayed value if it is usable as part of a dedupe or spend key, else undefined. */
 function validKeyPart(value: unknown): string | undefined {
