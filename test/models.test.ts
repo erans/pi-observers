@@ -143,6 +143,12 @@ describe("normalizeModelId (exploratory)", () => {
     expect(normalizeModelId("model-20240132")).toBe("model-20240132");
   });
 
+  it("strips a trailing date stamp for years 2100-2999 (comment documents 2000-2999)", () => {
+    // The regex must accept the full documented range, not just 2000-2099.
+    expect(normalizeModelId("model-21500101")).toBe("model");
+    expect(normalizeModelId("model-29991231")).toBe("model");
+  });
+
   it("does not strip 8 digits that are not preceded by a dash", () => {
     // If there's no dash before the 8 digits, they're part of the id and should not be stripped
     expect(normalizeModelId("model20251001")).toBe("model20251001");
