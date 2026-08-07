@@ -8,17 +8,6 @@ import { DEFAULTS, type Proposal } from "./types.ts";
  */
 const MAX_RESTORED_ENTRIES = 1000;
 
-/**
- * Bound on one replayed fingerprint. Nothing upstream limits fingerprint length: a
- * model can emit a megabyte of it and src/outputs.ts will accept it.
- *
- * Over-long fingerprints are REJECTED, never truncated. Truncating would map two
- * distinct advisories that share a long prefix onto one key, so accepting the first
- * would silently suppress the second -- advice lost with no trace. Rejecting means an
- * advisory with an absurd fingerprint may be delivered again after a reload, which is
- * visible, bounded by the per-turn advisory budget, and strictly the better failure.
- */
-
 /** The replayed value if it is usable as part of a dedupe or spend key, else undefined. */
 function validKeyPart(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
