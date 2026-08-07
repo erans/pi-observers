@@ -101,15 +101,8 @@ ${sanitizedText}
       throw error;
     }
   }
-  // Fallback if wx loop exhausted (should not happen)
-  content = `---
-name: ${JSON.stringify(slug)}
-description: ${JSON.stringify(deriveDescription(text))}
-type: ${type}
----
-
-${text.startsWith("---") ? `\n${text}` : text}
-`;
-  writeFileSync(path, content, "utf8");
-  return { path, slug };
+  // 100 collisions means a runaway caller, a pathological slug, or an attack.
+  // Failing loudly is correct — silently clobbering an existing note is the bug
+  // the wx loop was introduced to prevent, and the fallback reintroduced it.
+  throw new Error(`could not write memory note: "${base}" already has 100 variants on disk`);
 }
