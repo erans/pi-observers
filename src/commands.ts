@@ -59,6 +59,16 @@ export function writeGoal(cwd: string, text: string): string {
   }
 
   mkdirSync(dirname(path), { recursive: true });
+  // A symlink at the goal path (e.g. committed by a hostile repo) would be followed by
+  // the writeFileSync below, writing goal text into the symlink's target. Remove any
+  // symlink before writing so the goal always lands as a regular file at this path.
+  // lstat (not stat) so a symlink is reported as a symlink even if its target is missing.
+  try {
+    const preStat = lstatSync(path);
+    if (preStat.isSymbolicLink()) unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+  }
   // The ordinary case — an existing goal file, or no goal path at all — writes in
   // place with no pre-emptive delete. `writeFileSync` truncates-and-rewrites a plain
   // file, which keeps a crash between two /goal calls from ever losing an existing

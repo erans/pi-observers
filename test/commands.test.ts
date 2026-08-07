@@ -1,6 +1,15 @@
-import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { formatObserverStatus, goalFilePath, readGoal, writeGoal } from "../src/commands.ts";
@@ -142,6 +151,29 @@ describe("writeGoal — goal path is a directory, not a file", () => {
     mkdirSync(join(goalFilePath(cwd), "nested"), { recursive: true });
     expect(() => writeGoal(cwd, "   ")).not.toThrow();
     expect(existsSync(goalFilePath(cwd))).toBe(false);
+  });
+});
+
+describe("writeGoal — goal path is a symlink", () => {
+  it("removes the symlink and writes a regular file, never writing through to the target", () => {
+    // A committed symlink at the goal path must not let /goal write goal text into
+    // the symlink's target. writeGoal should unlink the symlink and write a fresh
+    // regular file at the goal path.
+    const target = join(cwd, "attacker-target.txt");
+    writeFileSync(target, "sensitive", "utf8");
+    const goalPath = goalFilePath(cwd);
+    mkdirSync(dirname(goalPath), { recursive: true });
+    symlinkSync(target, goalPath);
+
+    writeGoal(cwd, "Ship the parser");
+
+    // The symlink is gone; a regular file exists at the goal path.
+    const stat = lstatSync(goalPath);
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.isFile()).toBe(true);
+    expect(readGoal(cwd)).toBe("Ship the parser");
+    // The symlink's target was NOT overwritten with goal text.
+    expect(readFileSync(target, "utf8")).toBe("sensitive");
   });
 });
 
