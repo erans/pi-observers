@@ -33,6 +33,16 @@ export interface ProposalCollector {
  */
 export const BLANK = /[\s\u0085\p{Cf}\u2800\u115F\u1160\u17B4\u17B5\u3164\uFFA0]/gu;
 
+/**
+ * Bound on a fingerprint's length. Emission (src/outputs.ts) rejects fingerprints
+ * exceeding this length; the reconciler rejects them again on replay.
+ *
+ * Over-long fingerprints are REJECTED, never truncated. Truncating would map two
+ * distinct advisories that share a long prefix onto one key, so accepting the first
+ * would silently suppress the second -- advice lost with no trace. Rejecting means an
+ * advisory with an absurd fingerprint may be delivered again after a reload, which is
+ * visible, bounded by the per-turn advisory budget, and strictly the better failure.
+ */
 export const MAX_FINGERPRINT_LENGTH = 512;
 
 export function isBlank(value: string): boolean {

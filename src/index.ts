@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CONFIG_DIR_NAME,
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
@@ -413,7 +414,10 @@ function describeError(error: unknown): string {
  * Reading is side-effect free: loadFromStorage's withLock callback returns undefined,
  * so no settings file is rewritten by this call.
  */
-export function readObserverSettingsBlock(cwd: string, projectTrusted: boolean): unknown {
+export function readObserverSettingsBlock(
+  cwd: string,
+  projectTrusted: boolean,
+): { block: unknown; errors: Array<{ file: string; message: string }> } {
   try {
     const manager = SettingsManager.create(cwd, getAgentDir(), { projectTrusted });
     // `observers` is not a field of pi's Settings interface -- it is an extension's own
@@ -438,16 +442,25 @@ export function readObserverSettingsBlock(cwd: string, projectTrusted: boolean):
       }
       merged.disable = union;
     }
-    return Object.keys(merged).length > 0 ? merged : undefined;
+    const block = Object.keys(merged).length > 0 ? merged : undefined;
+    const errors = manager.drainErrors().map((e) => ({
+      file:
+        e.scope === "global"
+          ? join(getAgentDir(), "settings.json")
+          : join(cwd, CONFIG_DIR_NAME, "settings.json"),
+      message: `observer settings could not be loaded: ${String(e.error)}`,
+    }));
+    return { block, errors };
   } catch (error) {
-    // Tolerant but not silent: surface the cause so a broken global settings.json
-    // does not invisibly degrade to defaults while the user believes their disable
-    // list is active. The caller (session_start) renders discoveryErrors via
-    // observerNotes, so we push a synthetic entry there by storing on a module-level
-    // variable that the next session_start drains — but to keep this function pure we
-    // just warn to the console and still degrade to defaults.
-    console.warn(`[pi-observers] failed to read observer settings: ${String(error)}`);
-    return undefined;
+    // A failure to construct/read the manager at all (not just a parse error, which
+    // drainErrors covers) surfaces here. Treat it like a settings load error so the
+    // user sees their disable list is not silently active.
+    return {
+      block: undefined,
+      errors: [
+        { file: "settings", message: `observer settings could not be read: ${String(error)}` },
+      ],
+    };
   }
 }
 
@@ -477,7 +490,10 @@ interface Loaded {
 export interface ObserverDeps {
   discover: typeof discoverObservers;
   createRunner: typeof createObserverRunner;
-  readSettingsBlock: (cwd: string, projectTrusted: boolean) => unknown;
+  readSettingsBlock: (
+    cwd: string,
+    projectTrusted: boolean,
+  ) => { block: unknown; errors: Array<{ file: string; message: string }> };
   diagnose: (cwd: string) => GoalDiagnosis;
 }
 
@@ -938,7 +954,11 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     // holding a nested session would otherwise leak one session per reload.
     disposeAll();
 
-    settings = parseSettings(deps.readSettingsBlock(ctx.cwd, ctx.isProjectTrusted()));
+    const { block: settingsBlock, errors: settingsErrors } = deps.readSettingsBlock(
+      ctx.cwd,
+      ctx.isProjectTrusted(),
+    );
+    settings = parseSettings(settingsBlock);
     reconciler = new Reconciler({
       maxAdvisoriesPerTurn: settings.maxAdvisoriesPerTurn,
       vetoBudget: settings.vetoBudget,
@@ -1013,9 +1033,15 @@ export default function (pi: ExtensionAPI, deps: ObserverDeps = DEFAULT_DEPS) {
     });
 
     // Replaces the previous session's list outright; see the note in the reset block.
-    discoveryErrors = errors.map((error) => ({ file: error.file, message: error.message }));
+    discoveryErrors = [
+      ...errors.map((error) => ({ file: error.file, message: error.message })),
+      ...settingsErrors,
+    ];
     for (const error of errors) {
       if (ctx.hasUI) ctx.ui.notify(`observer "${error.file}": ${error.message}`, "error");
+    }
+    for (const error of settingsErrors) {
+      if (ctx.hasUI) ctx.ui.notify(`observer settings: ${error.message}`, "error");
     }
 
     const lookup = modelLookup(ctx);

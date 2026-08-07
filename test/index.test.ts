@@ -206,7 +206,7 @@ function deps(over: Partial<ObserverDeps> = {}): ObserverDeps {
     createRunner: async () => {
       throw new Error("createRunner not stubbed");
     },
-    readSettingsBlock: () => undefined,
+    readSettingsBlock: () => ({ block: undefined, errors: [] }),
     diagnose: () => ({ state: "unset" }),
     ...over,
   };
@@ -639,14 +639,16 @@ describe("readObserverSettingsBlock", () => {
     const path = join(cwd, CONFIG_DIR_NAME, "settings.json");
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ observers: { maxAdvisoriesPerTurn: 1 } }), "utf8");
-    expect(readObserverSettingsBlock(cwd, true)).toEqual({ maxAdvisoriesPerTurn: 1 });
+    const { block } = readObserverSettingsBlock(cwd, true);
+    expect(block).toEqual({ maxAdvisoriesPerTurn: 1 });
   });
 
   it("ignores project settings when the project is not trusted", () => {
     const path = join(cwd, CONFIG_DIR_NAME, "settings.json");
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ observers: { maxAdvisoriesPerTurn: 1 } }), "utf8");
-    expect(readObserverSettingsBlock(cwd, false)).toBeUndefined();
+    const { block } = readObserverSettingsBlock(cwd, false);
+    expect(block).toBeUndefined();
   });
 
   it("lets a trusted project override the global block field by field", () => {
@@ -660,17 +662,22 @@ describe("readObserverSettingsBlock", () => {
     const projectPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
     mkdirSync(dirname(projectPath), { recursive: true });
     writeFileSync(projectPath, JSON.stringify({ observers: { vetoBudget: 1 } }), "utf8");
-    expect(readObserverSettingsBlock(cwd, true)).toEqual({
+    const { block } = readObserverSettingsBlock(cwd, true);
+    expect(block).toEqual({
       vetoBudget: 1,
       defaultModel: "g/one",
     });
   });
 
-  it("degrades to undefined on a corrupt settings file rather than throwing", () => {
-    const path = join(cwd, CONFIG_DIR_NAME, "settings.json");
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, "{not json", "utf8");
-    expect(readObserverSettingsBlock(cwd, true)).toBeUndefined();
+  it("surfaces a corrupt settings file as a load error instead of silently degrading", () => {
+    const projectPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+    mkdirSync(dirname(projectPath), { recursive: true });
+    writeFileSync(projectPath, "{not json", "utf8");
+    const { block, errors } = readObserverSettingsBlock(cwd, true);
+    expect(block).toBeUndefined();
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.some((e) => /could not be loaded/i.test(e.message))).toBe(true);
+    expect(errors.some((e) => e.file === projectPath)).toBe(true);
   });
 });
 
@@ -690,7 +697,7 @@ describe("settings reach the wiring", () => {
       deps({
         discover: () => ({ observers: [def({ name: "obs" })], errors: [] }),
         createRunner: async () => emitting("obs", null),
-        readSettingsBlock: () => block,
+        readSettingsBlock: () => ({ block, errors: [] }),
       }),
     );
     await fire(h, "session_start", {}, ctx);
@@ -839,7 +846,7 @@ describe("delivery", () => {
       };
     }
     const { ctx, notices } = await bootWith(h, definitions, runners, {
-      readSettingsBlock: () => ({ maxAdvisoriesPerTurn: 10 }),
+      readSettingsBlock: () => ({ block: { maxAdvisoriesPerTurn: 10 }, errors: [] }),
     });
 
     // Round 0 fills the window; round 1's veto parks "the point" in the deferral;
@@ -885,7 +892,7 @@ describe("delivery", () => {
       };
     }
     const { ctx, notices } = await bootWith(h, definitions, runners, {
-      readSettingsBlock: () => ({ maxAdvisoriesPerTurn: 10 }),
+      readSettingsBlock: () => ({ block: { maxAdvisoriesPerTurn: 10 }, errors: [] }),
     });
 
     for (round = 0; round < 40; round++) {
@@ -1623,7 +1630,7 @@ describe("delivery", () => {
         a: emitting("a", p("a", "kept advice", { priority: 90 })),
         b: emitting("b", p("b", "dropped advice", { priority: 10 })),
       },
-      { readSettingsBlock: () => ({ maxAdvisoriesPerTurn: 1 }) },
+      { readSettingsBlock: () => ({ block: { maxAdvisoriesPerTurn: 1 }, errors: [] }) },
     );
 
     await fire(h, "turn_end", {}, ctx);
@@ -1832,7 +1839,7 @@ describe("session_start resets", () => {
     const veto = p("goal", "not done", { kind: "veto", deliver: "settle", fingerprint: "g1" });
     const { ctx } = build(h, emitting("goal", veto), {
       discover: () => ({ observers: [vetoDef], errors: [] }),
-      readSettingsBlock: () => ({ vetoBudget: 1 }),
+      readSettingsBlock: () => ({ block: { vetoBudget: 1 }, errors: [] }),
     });
     await fire(h, "session_start", {}, ctx);
 

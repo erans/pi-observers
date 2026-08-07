@@ -26,9 +26,11 @@ function hasDefinitions(dir: string): boolean {
   try {
     return readdirSync(dir).some((entry) => entry.endsWith(".md"));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
-    // Permission errors (EACCES/EPERM) should not suppress the trust warning —
-    // propagate as true so the caller can surface the unreadable state.
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    // Permission/I/O errors (EACCES/EPERM/EIO) should not suppress the trust
+    // warning — propagate as true so the caller can surface the unreadable state,
+    // and loadDir will report the concrete error once the project is trusted.
     return true;
   }
 }

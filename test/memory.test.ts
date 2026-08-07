@@ -1,6 +1,6 @@
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
@@ -59,6 +59,34 @@ describe("writeMemoryNote", () => {
     expect(second.slug).toBe(`${first.slug}-2`);
     expect(existsSync(first.path)).toBe(true);
     expect(existsSync(second.path)).toBe(true);
+  });
+
+  it("throws after 100 slug collisions instead of overwriting an existing note", () => {
+    // Pre-create 100 base-N.md files for a known slug so the wx loop exhausts.
+    // The fallback must NOT clobber base-101.md (or any existing file).
+    const text = "Fixed slug text here"; // deriveSlug -> "fixed-slug-text-here"
+    // First, one real call to learn the slug + dir the implementation produces:
+    const first = writeMemoryNote({ cwd, text });
+    const base = first.slug;
+    const dir = dirname(first.path);
+    // Pre-create base-2.md .. base-100.md so the next call collides 100 times total
+    // (base.md exists from `first`; base-2..base-100 created here; the next call
+    // tries base-2..base-101 over 100 attempts and never finds a free slot).
+    for (let n = 2; n <= 100; n++) {
+      writeFileSync(join(dir, `${base}-${n}.md`), "pre-existing", "utf8");
+    }
+    // Snapshot existing files + contents (base.md + base-2..base-100 = 100 files)
+    const before = new Map<string, string>();
+    before.set(first.path, readFileSync(first.path, "utf8"));
+    for (let n = 2; n <= 100; n++) {
+      const p = join(dir, `${base}-${n}.md`);
+      before.set(p, readFileSync(p, "utf8"));
+    }
+    expect(() => writeMemoryNote({ cwd, text })).toThrow(/100 variants/i);
+    // No existing file was modified
+    for (const [p, content] of before) {
+      expect(readFileSync(p, "utf8")).toBe(content);
+    }
   });
 
   it("creates the memory directory if absent", () => {

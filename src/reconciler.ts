@@ -1,4 +1,4 @@
-import { isBlank } from "./outputs.ts";
+import { isBlank, MAX_FINGERPRINT_LENGTH } from "./outputs.ts";
 import { DEFAULTS, type Proposal } from "./types.ts";
 
 /**
@@ -7,18 +7,6 @@ import { DEFAULTS, type Proposal } from "./types.ts";
  * but replayed state is not, because every reload re-reads the whole session file.
  */
 const MAX_RESTORED_ENTRIES = 1000;
-
-/**
- * Bound on one replayed fingerprint. Nothing upstream limits fingerprint length: a
- * model can emit a megabyte of it and src/outputs.ts will accept it.
- *
- * Over-long fingerprints are REJECTED, never truncated. Truncating would map two
- * distinct advisories that share a long prefix onto one key, so accepting the first
- * would silently suppress the second -- advice lost with no trace. Rejecting means an
- * advisory with an absurd fingerprint may be delivered again after a reload, which is
- * visible, bounded by the per-turn advisory budget, and strictly the better failure.
- */
-const MAX_FINGERPRINT_LENGTH = 512;
 
 /** The replayed value if it is usable as part of a dedupe or spend key, else undefined. */
 function validKeyPart(value: unknown): string | undefined {
